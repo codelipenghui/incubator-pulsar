@@ -316,6 +316,7 @@ public class Producer {
 
         private long highestSequenceId;
         private long originalHighestSequenceId;
+        private int batchIndex;
 
         public String getProducerName() {
             return producer.getProducerName();
@@ -362,6 +363,16 @@ public class Producer {
         @Override
         public long getOriginalHighestSequenceId() {
             return originalHighestSequenceId;
+        }
+
+        @Override
+        public void setBatchIndex(int batchIndex) {
+            this.batchIndex = batchIndex;
+        }
+
+        @Override
+        public long getBatchSize() {
+            return batchSize;
         }
 
         /**
@@ -422,7 +433,7 @@ public class Producer {
             rateIn.recordMultipleEvents(batchSize, msgSize);
             producer.topic.recordAddLatency(System.nanoTime() - startTimeNs, TimeUnit.NANOSECONDS);
             producer.cnx.getCommandSender().sendSendReceiptResponse(producer.producerId, sequenceId, highestSequenceId,
-                    ledgerId, entryId);
+                    ledgerId, entryId, batchIndex);
             producer.cnx.completedSendOperation(producer.isNonPersistentTopic, msgSize);
             if (this.chunked) {
                 producer.chunkedMessageRate.recordEvent();
@@ -492,6 +503,7 @@ public class Producer {
             batchSize = 0L;
             startTimeNs = -1L;
             chunked = false;
+            batchIndex = -1;
             recyclerHandle.recycle(this);
         }
     }

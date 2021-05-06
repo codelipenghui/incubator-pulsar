@@ -2646,6 +2646,10 @@ public class BrokerService implements Closeable, ZooKeeperCacheListener<Policies
         return !brokerEntryMetadataInterceptors.isEmpty();
     }
 
+    public boolean isBrokerLevelPublishBatchEnabled() {
+        return true;
+    }
+
     public void pausedConnections(int numberOfConnections) {
         pausedConnections.add(numberOfConnections);
     }

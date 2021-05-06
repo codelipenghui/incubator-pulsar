@@ -359,7 +359,7 @@ public class Commands {
     }
 
     public static BaseCommand newSendReceiptCommand(long producerId, long sequenceId, long highestId, long ledgerId,
-            long entryId) {
+            long entryId, int batchIndex) {
         BaseCommand cmd = localCmd(Type.SEND_RECEIPT);
         cmd.setSendReceipt()
                 .setProducerId(producerId)
@@ -367,13 +367,15 @@ public class Commands {
                 .setHighestSequenceId(highestId)
                 .setMessageId()
                 .setLedgerId(ledgerId)
+                .setBatchIndex(batchIndex)
                 .setEntryId(entryId);
         return cmd;
     }
 
     public static ByteBuf newSendReceipt(long producerId, long sequenceId, long highestId, long ledgerId,
-            long entryId) {
-        return serializeWithSize(newSendReceiptCommand(producerId, sequenceId, highestId, ledgerId, entryId));
+            long entryId, int batchIndex) {
+        return serializeWithSize(newSendReceiptCommand(producerId, sequenceId, highestId, ledgerId, entryId,
+                batchIndex));
     }
 
     public static BaseCommand newSendErrorCommand(long producerId, long sequenceId, ServerError error,
@@ -1440,7 +1442,7 @@ public class Commands {
 
         BrokerEntryMetadata brokerEntryMetadata = BROKER_ENTRY_METADATA.get();
         for (BrokerEntryMetadataInterceptor interceptor : brokerInterceptors) {
-            interceptor.intercept(brokerEntryMetadata);
+            interceptor.intercept(brokerEntryMetadata, headerAndPayload);
             if (numberOfMessages >= 0) {
                 interceptor.interceptWithNumberOfMessages(brokerEntryMetadata, numberOfMessages);
             }

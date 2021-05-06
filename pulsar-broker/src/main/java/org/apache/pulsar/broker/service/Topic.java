@@ -60,6 +60,13 @@ public interface Topic {
         default void setOriginalSequenceId(long originalSequenceId) {
         }
 
+        default void setBatchIndex(int batchIndex) {
+        }
+
+        default long getBatchSize() {
+            return -1;
+        }
+
         /**
          * Return the producer name for the original producer.
          *

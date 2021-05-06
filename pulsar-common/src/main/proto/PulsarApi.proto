@@ -184,6 +184,7 @@ message SingleMessageMetadata {
 message BrokerEntryMetadata {
     optional uint64 broker_timestamp = 1;
     optional uint64 index = 2;
+    repeated uint64 batch_offsets = 3;
 }
 
 enum ServerError {

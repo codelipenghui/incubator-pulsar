@@ -985,7 +985,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
         });
     }
 
-    void messageReceived(MessageIdData messageId, int redeliveryCount, List<Long> ackSet, ByteBuf headersAndPayload, ClientCnx cnx) {
+    void messageReceived(MessageIdData messageId, int redeliveryCount, List<Long> ackSet, ByteBuf headersAndPayload, ClientCnx cnx, int batchIndexOffset) {
         if (log.isDebugEnabled()) {
             log.debug("[{}][{}] Received message: {}/{}", topic, subscription, messageId.getLedgerId(),
                     messageId.getEntryId());
@@ -1009,7 +1009,8 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
         final int numChunks = msgMetadata.hasNumChunksFromMsg() ? msgMetadata.getNumChunksFromMsg() : 0;
         final boolean isChunkedMessage = numChunks > 1 && conf.getSubscriptionType() != SubscriptionType.Shared;
 
-        MessageIdImpl msgId = new MessageIdImpl(messageId.getLedgerId(), messageId.getEntryId(), getPartitionIndex());
+        MessageIdImpl msgId = batchIndexOffset == -1 ? new MessageIdImpl(messageId.getLedgerId(), messageId.getEntryId(), getPartitionIndex())
+                : new BatchMessageIdImpl(messageId.getLedgerId(), messageId.getEntryId(), getPartitionIndex(), batchIndexOffset);
         if (acknowledgmentsGroupingTracker.isDuplicate(msgId)) {
             if (log.isDebugEnabled()) {
                 log.debug("[{}] [{}] Ignoring message as it was already being acked earlier by same consumer {}/{}",
@@ -1083,7 +1084,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
             });
         } else {
             // handle batch message enqueuing; uncompressed payload has all messages in batch
-            receiveIndividualMessagesFromBatch(msgMetadata, redeliveryCount, ackSet, uncompressedPayload, messageId, cnx);
+            receiveIndividualMessagesFromBatch(msgMetadata, redeliveryCount, ackSet, uncompressedPayload, messageId, cnx, batchIndexOffset);
 
             uncompressedPayload.release();
         }
@@ -1232,7 +1233,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
     }
 
     void receiveIndividualMessagesFromBatch(MessageMetadata msgMetadata, int redeliveryCount, List<Long> ackSet, ByteBuf uncompressedPayload,
-            MessageIdData messageId, ClientCnx cnx) {
+            MessageIdData messageId, ClientCnx cnx, int batchIndexOffset) {
         int batchSize = msgMetadata.getNumMessagesInBatch();
 
         // create ack tracker for entry aka batch
@@ -1288,7 +1289,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
                 }
 
                 BatchMessageIdImpl batchMessageIdImpl = new BatchMessageIdImpl(messageId.getLedgerId(),
-                        messageId.getEntryId(), getPartitionIndex(), i, batchSize, acker);
+                        messageId.getEntryId(), getPartitionIndex(), i + batchIndexOffset, batchSize, acker);
                 final MessageImpl<T> message = MessageImpl.create(topicName.toString(), batchMessageIdImpl,
                         msgMetadata, singleMessageMetadata, singleMessagePayload,
                         createEncryptionContext(msgMetadata), cnx, schema, redeliveryCount, poolMessages);

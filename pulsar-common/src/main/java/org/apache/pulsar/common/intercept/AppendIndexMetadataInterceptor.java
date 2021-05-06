@@ -20,6 +20,7 @@ package org.apache.pulsar.common.intercept;
 
 import java.util.concurrent.atomic.AtomicLong;
 
+import io.netty.buffer.ByteBuf;
 import org.apache.pulsar.common.api.proto.BrokerEntryMetadata;
 
 public class AppendIndexMetadataInterceptor implements BrokerEntryMetadataInterceptor{
@@ -36,7 +37,7 @@ public class AppendIndexMetadataInterceptor implements BrokerEntryMetadataInterc
     }
 
     @Override
-    public BrokerEntryMetadata intercept(BrokerEntryMetadata brokerMetadata) {
+    public BrokerEntryMetadata intercept(BrokerEntryMetadata brokerMetadata, ByteBuf headersAndPayload) {
         // do nothing, just return brokerMetadata
         return brokerMetadata;
     }

@@ -62,6 +62,8 @@ import org.apache.pulsar.client.impl.tls.TlsHostnameVerifier;
 import org.apache.pulsar.client.impl.transaction.TransactionBufferHandler;
 import org.apache.pulsar.client.util.TimedCompletableFuture;
 import org.apache.pulsar.common.api.AuthData;
+import org.apache.pulsar.common.api.proto.BrokerEntryMetadata;
+import org.apache.pulsar.common.api.proto.CommandAck;
 import org.apache.pulsar.common.api.proto.CommandAckResponse;
 import org.apache.pulsar.common.api.proto.CommandActiveConsumerChange;
 import org.apache.pulsar.common.api.proto.CommandAddPartitionToTxnResponse;
@@ -87,6 +89,7 @@ import org.apache.pulsar.common.api.proto.CommandReachedEndOfTopic;
 import org.apache.pulsar.common.api.proto.CommandSendError;
 import org.apache.pulsar.common.api.proto.CommandSendReceipt;
 import org.apache.pulsar.common.api.proto.CommandSuccess;
+import org.apache.pulsar.common.api.proto.MessageMetadata;
 import org.apache.pulsar.common.api.proto.ServerError;
 import org.apache.pulsar.common.protocol.Commands;
 import org.apache.pulsar.common.protocol.PulsarHandler;
@@ -383,9 +386,11 @@ public class ClientCnx extends PulsarHandler {
         long highestSequenceId = sendReceipt.getHighestSequenceId();
         long ledgerId = -1;
         long entryId = -1;
+        int batchIndexOffset = -1;
         if (sendReceipt.hasMessageId()) {
             ledgerId = sendReceipt.getMessageId().getLedgerId();
             entryId = sendReceipt.getMessageId().getEntryId();
+            batchIndexOffset = sendReceipt.getMessageId().getBatchIndex();
         }
 
         if (ledgerId == -1 && entryId == -1) {
@@ -400,7 +405,7 @@ public class ClientCnx extends PulsarHandler {
 
         ProducerImpl<?> producer = producers.get(producerId);
         if (producer != null) {
-            producer.ackReceived(this, sequenceId, highestSequenceId, ledgerId, entryId);
+            producer.ackReceived(this, sequenceId, highestSequenceId, ledgerId, entryId, batchIndexOffset);
         } else {
             if (log.isDebugEnabled()) {
                 log.debug("Producer is {} already closed, ignore published message [{}-{}]", producerId, ledgerId,
@@ -444,7 +449,40 @@ public class ClientCnx extends PulsarHandler {
                     ackSets.add(cmdMessage.getAckSetAt(i));
                 }
             }
-            consumer.messageReceived(cmdMessage.getMessageId(), cmdMessage.getRedeliveryCount(), ackSets, headersAndPayload, this);
+            BrokerEntryMetadata brokerEntryMetadata = Commands.parseBrokerEntryMetadataIfExist(headersAndPayload);
+            ByteBuf byteBuf = Commands.skipBrokerEntryMetadataIfExist(headersAndPayload);
+            int readIndex = headersAndPayload.readerIndex();
+            if (brokerEntryMetadata != null) {
+                if (brokerEntryMetadata.getBatchOffsetsCount() > 1) {
+
+                    long startOffset = 0;
+                    int batchIndexOffset = 0;
+                    for (int i = 1; i < brokerEntryMetadata.getBatchOffsetsCount(); i++) {
+                        long batchOffset = brokerEntryMetadata.getBatchOffsetAt(i);
+                        int start = (int)startOffset + readIndex;
+                        int length = (int)batchOffset - (int)startOffset;
+                        ByteBuf sliced = byteBuf.retainedSlice(start, length);
+                        MessageMetadata msgMetadata = Commands.parseMessageMetadata(sliced);
+                        sliced.readerIndex(0);
+                        consumer.messageReceived(cmdMessage.getMessageId(), cmdMessage.getRedeliveryCount(), ackSets, sliced, this, batchIndexOffset);
+                        batchIndexOffset += msgMetadata.getNumMessagesInBatch();
+                        startOffset = batchOffset;
+                    }
+
+                    // send the remaining
+                    int start = (int)startOffset + readIndex;
+                    int length = headersAndPayload.writerIndex() - start;
+                    ByteBuf sliced = byteBuf.retainedSlice(start, length);
+                    sliced.readerIndex(0);
+                    consumer.messageReceived(cmdMessage.getMessageId(), cmdMessage.getRedeliveryCount(), ackSets, sliced, this, batchIndexOffset);
+                    headersAndPayload.release();
+
+                } else {
+                    consumer.messageReceived(cmdMessage.getMessageId(), cmdMessage.getRedeliveryCount(), ackSets, byteBuf, this, -1);
+                }
+            } else {
+                consumer.messageReceived(cmdMessage.getMessageId(), cmdMessage.getRedeliveryCount(), ackSets, byteBuf, this, -1);
+            }
         }
     }
 

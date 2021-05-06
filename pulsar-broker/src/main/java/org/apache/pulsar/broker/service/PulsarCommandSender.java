@@ -45,7 +45,7 @@ public interface PulsarCommandSender {
                                      boolean isProducerReady);
 
     void sendSendReceiptResponse(long producerId, long sequenceId, long highestId, long ledgerId,
-                                 long entryId);
+                                 long entryId, int batchIndex);
 
     void sendSendError(long producerId, long sequenceId, ServerError error, String errorMsg);
 

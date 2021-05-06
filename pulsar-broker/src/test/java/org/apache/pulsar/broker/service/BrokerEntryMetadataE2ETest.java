@@ -21,6 +21,7 @@ package org.apache.pulsar.broker.service;
 import lombok.Cleanup;
 import org.apache.pulsar.client.api.Consumer;
 import org.apache.pulsar.client.api.Message;
+import org.apache.pulsar.client.api.MessageId;
 import org.apache.pulsar.client.api.Producer;
 import org.apache.pulsar.client.api.SubscriptionType;
 import org.assertj.core.util.Sets;
@@ -29,6 +30,11 @@ import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
+
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Test for the broker entry metadata.
@@ -50,7 +56,8 @@ public class BrokerEntryMetadataE2ETest extends BrokerTestBase {
     protected void setup() throws Exception {
         conf.setBrokerEntryMetadataInterceptors(Sets.newTreeSet(
                 "org.apache.pulsar.common.intercept.AppendBrokerTimestampMetadataInterceptor",
-                "org.apache.pulsar.common.intercept.AppendIndexMetadataInterceptor"
+                "org.apache.pulsar.common.intercept.AppendIndexMetadataInterceptor",
+                "org.apache.pulsar.common.intercept.AppendBatchOffsetsMetadataInterceptor"
                 ));
         baseSetup();
     }
@@ -89,5 +96,37 @@ public class BrokerEntryMetadataE2ETest extends BrokerTestBase {
         }
 
         Assert.assertEquals(messages, receives);
+    }
+
+    @Test
+    public void testBrokerBatch() throws Exception {
+        final String topic = newTopicName();
+        final int messages = 10;
+
+        @Cleanup
+        Producer<byte[]> producer = pulsarClient.newProducer()
+                .topic(topic)
+                .enableBatching(false)
+                .create();
+
+        @Cleanup
+        Consumer<byte[]> consumer = pulsarClient.newConsumer()
+                .topic(topic)
+                .subscriptionName("my-sub")
+                .subscribe();
+
+        List<CompletableFuture<MessageId>> futures = new ArrayList<>();
+        for (int i = 0; i < messages; i++) {
+            futures.add(producer.sendAsync("Hello Pulsar".getBytes(StandardCharsets.UTF_8)));
+        }
+
+        for (CompletableFuture<MessageId> future : futures) {
+            System.out.println(future.get());
+        }
+
+        for (int i = 0; i < messages; i++) {
+            Message<byte[]> received = consumer.receive();
+            System.out.println(received.getMessageId());
+        }
     }
 }

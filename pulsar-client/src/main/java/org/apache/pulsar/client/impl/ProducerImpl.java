@@ -932,7 +932,7 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
         }
     }
 
-    void ackReceived(ClientCnx cnx, long sequenceId, long highestSequenceId, long ledgerId, long entryId) {
+    void ackReceived(ClientCnx cnx, long sequenceId, long highestSequenceId, long ledgerId, long entryId, int batchIndexOffset) {
         OpSendMsg op = null;
         boolean callback = false;
         synchronized (this) {
@@ -980,7 +980,7 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
                 OpSendMsg finalOp = op;
                 LAST_SEQ_ID_PUBLISHED_UPDATER.getAndUpdate(this,
                         last -> Math.max(last, getHighestSequenceId(finalOp)));
-                op.setMessageId(ledgerId, entryId, partitionIndex);
+                op.setMessageId(ledgerId, entryId, partitionIndex, batchIndexOffset);
                 try {
                     // if message is chunked then call callback only on last chunk
                     if (op.totalChunks <= 1 || (op.chunkId == op.totalChunks - 1)) {
@@ -1253,13 +1253,17 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
             this.batchSizeByte = batchSizeByte;
         }
 
-        void setMessageId(long ledgerId, long entryId, int partitionIndex) {
+        void setMessageId(long ledgerId, long entryId, int partitionIndex, int batchIndexOffset) {
             if (msg != null) {
-                msg.setMessageId(new MessageIdImpl(ledgerId, entryId, partitionIndex));
+                if (batchIndexOffset > -1) {
+                    msg.setMessageId(new BatchMessageIdImpl(ledgerId, entryId, partitionIndex, batchIndexOffset));
+                } else {
+                    msg.setMessageId(new MessageIdImpl(ledgerId, entryId, partitionIndex));
+                }
             } else {
                 for (int batchIndex = 0; batchIndex < msgs.size(); batchIndex++) {
                     msgs.get(batchIndex)
-                            .setMessageId(new BatchMessageIdImpl(ledgerId, entryId, partitionIndex, batchIndex));
+                            .setMessageId(new BatchMessageIdImpl(ledgerId, entryId, partitionIndex, batchIndex + batchIndexOffset));
                 }
             }
         }

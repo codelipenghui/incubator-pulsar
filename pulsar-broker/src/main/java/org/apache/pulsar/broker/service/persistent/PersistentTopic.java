@@ -28,6 +28,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.CompositeByteBuf;
 import io.netty.util.concurrent.FastThreadLocal;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -68,6 +69,7 @@ import org.apache.bookkeeper.mledger.impl.ManagedLedgerImpl;
 import org.apache.bookkeeper.mledger.impl.PositionImpl;
 import org.apache.bookkeeper.net.BookieId;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.tuple.Pair;
 import org.apache.pulsar.broker.PulsarServerException;
 import org.apache.pulsar.broker.ServiceConfiguration;
 import org.apache.pulsar.broker.admin.AdminResource;
@@ -110,6 +112,7 @@ import org.apache.pulsar.client.api.transaction.TxnID;
 import org.apache.pulsar.client.impl.BatchMessageIdImpl;
 import org.apache.pulsar.client.impl.MessageIdImpl;
 import org.apache.pulsar.client.impl.MessageImpl;
+import org.apache.pulsar.common.allocator.PulsarByteBufAllocator;
 import org.apache.pulsar.common.api.proto.CommandSubscribe.InitialPosition;
 import org.apache.pulsar.common.api.proto.CommandSubscribe.SubType;
 import org.apache.pulsar.common.api.proto.KeySharedMeta;
@@ -409,10 +412,30 @@ public class PersistentTopic extends AbstractTopic
         }
     }
 
+    private List<Pair<ByteBuf, PublishContext>> publishBatch = new ArrayList<>();
+
     private void asyncAddEntry(ByteBuf headersAndPayload, PublishContext publishContext) {
         if (brokerService.isBrokerEntryMetadataEnabled()) {
-            ledger.asyncAddEntry(headersAndPayload,
-                    (int) publishContext.getNumberOfMessages(), this, publishContext);
+            if (brokerService.isBrokerLevelPublishBatchEnabled()) {
+                headersAndPayload.retain();
+                publishBatch.add(Pair.of(headersAndPayload, publishContext));
+                if (publishBatch.size() >= 10) {
+                    List<Pair<ByteBuf, PublishContext>> temp = new ArrayList<>(publishBatch);
+                    CompositeByteBuf compositeByteBuf = PulsarByteBufAllocator.DEFAULT.compositeBuffer(temp.size());
+                    int lastBatchIndexOffset = 0;
+                    for (Pair<ByteBuf, PublishContext> pair : temp) {
+                        compositeByteBuf.addComponent(true, pair.getLeft());
+                        pair.getRight().setBatchIndex(lastBatchIndexOffset);
+                        lastBatchIndexOffset += (int) pair.getRight().getBatchSize();
+                    }
+                    ledger.asyncAddEntry(compositeByteBuf,
+                            (int) publishContext.getNumberOfMessages(), this, temp);
+                    publishBatch.clear();
+                }
+            } else {
+                ledger.asyncAddEntry(headersAndPayload,
+                        (int) publishContext.getNumberOfMessages(), this, publishContext);
+            }
         } else {
             ledger.asyncAddEntry(headersAndPayload, this, publishContext);
         }
@@ -470,7 +493,17 @@ public class PersistentTopic extends AbstractTopic
 
     @Override
     public void addComplete(Position pos, ByteBuf entryData, Object ctx) {
-        PublishContext publishContext = (PublishContext) ctx;
+        if (ctx instanceof PublishContext) {
+            addComplete(pos, entryData, (PublishContext) ctx);
+        } else {
+            List<Pair<ByteBuf, PublishContext>> contexts = (List<Pair<ByteBuf, PublishContext>>) ctx;
+            for (Pair<ByteBuf, PublishContext> context : contexts) {
+                addComplete(pos, context.getLeft(), context.getRight());
+            }
+        }
+    }
+
+    private void addComplete(Position pos, ByteBuf entryData, PublishContext publishContext) {
         PositionImpl position = (PositionImpl) pos;
 
         // Message has been successfully persisted

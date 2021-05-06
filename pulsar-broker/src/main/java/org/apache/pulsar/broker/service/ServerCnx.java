@@ -1340,7 +1340,7 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
                 final long sequenceId = send.getSequenceId();
                 final long highestSequenceId = send.getHighestSequenceId();
                 service.getTopicOrderedExecutor().executeOrdered(producer.getTopic().getName(), SafeRun.safeRun(() -> {
-                    commandSender.sendSendReceiptResponse(producerId, sequenceId, highestSequenceId, -1, -1);
+                    commandSender.sendSendReceiptResponse(producerId, sequenceId, highestSequenceId, -1, -1, -1);
                 }));
                 producer.recordMessageDrop(send.getNumMessages());
                 return;

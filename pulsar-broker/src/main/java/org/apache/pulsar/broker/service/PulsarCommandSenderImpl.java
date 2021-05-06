@@ -100,9 +100,9 @@ public class PulsarCommandSenderImpl implements PulsarCommandSender {
 
     @Override
     public void sendSendReceiptResponse(long producerId, long sequenceId, long highestId, long ledgerId,
-                                        long entryId) {
+                                        long entryId, int batchIndex) {
         BaseCommand command = Commands.newSendReceiptCommand(producerId, sequenceId, highestId, ledgerId,
-                entryId);
+                entryId, batchIndex);
         safeIntercept(command, cnx);
         ByteBuf outBuf = Commands.serializeWithSize(command);
         cnx.ctx().writeAndFlush(outBuf);
@@ -244,7 +244,7 @@ public class PulsarCommandSenderImpl implements PulsarCommandSender {
                 // so, we can get chance to call entry.release
                 metadataAndPayload.retain();
                 // skip raw message metadata since broker timestamp only used in broker side
-                Commands.skipBrokerEntryMetadataIfExist(metadataAndPayload);
+//                Commands.skipBrokerEntryMetadataIfExist(metadataAndPayload);
                 // skip checksum by incrementing reader-index if consumer-client doesn't support checksum verification
                 if (cnx.getRemoteEndpointProtocolVersion() < ProtocolVersion.v11.getValue()) {
                     Commands.skipChecksumIfPresent(metadataAndPayload);

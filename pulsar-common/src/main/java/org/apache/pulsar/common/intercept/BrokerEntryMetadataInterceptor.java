@@ -18,6 +18,7 @@
  */
 package org.apache.pulsar.common.intercept;
 
+import io.netty.buffer.ByteBuf;
 import org.apache.pulsar.common.api.proto.BrokerEntryMetadata;
 import org.apache.pulsar.common.classification.InterfaceAudience;
 import org.apache.pulsar.common.classification.InterfaceStability;
@@ -32,7 +33,7 @@ public interface BrokerEntryMetadataInterceptor {
     /**
      * Called by ManagedLedger to intercept adding an entry.
      */
-    BrokerEntryMetadata intercept(BrokerEntryMetadata brokerMetadata);
+    BrokerEntryMetadata intercept(BrokerEntryMetadata brokerMetadata, ByteBuf headersAndPayload);
 
     /**
      * Called by ManagedLedger to intercept adding an entry with numberOfMessages.
