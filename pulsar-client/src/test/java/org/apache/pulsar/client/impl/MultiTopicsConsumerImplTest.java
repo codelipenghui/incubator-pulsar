@@ -198,6 +198,7 @@ public class MultiTopicsConsumerImplTest {
         // assert that we don't start in closed, then we move to closed and get an exception
         // indicating that closeAsync was called
         assertEquals(impl.getState(), HandlerState.State.Uninitialized);
+
         Awaitility.await().untilAsserted(() -> assertTrue(completeFuture.isCompletedExceptionally()));
         assertEquals(impl.getConsumers().size(), 0);
         assertEquals(impl.getState(), HandlerState.State.Closed);
