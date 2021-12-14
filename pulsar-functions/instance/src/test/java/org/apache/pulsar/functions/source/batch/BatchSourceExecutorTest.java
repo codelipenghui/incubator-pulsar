@@ -353,7 +353,7 @@ public class BatchSourceExecutorTest {
     batchSourceExecutor.open(pushConfig, context);
   }
 
-  @Test (timeOut = 5000)
+  @Test (timeOut = 10000)
   public void testLifeCycle() throws Exception {
     batchSourceExecutor.open(config, context);
     Assert.assertEquals(testBatchSource.getDiscoverCount(), 0);
