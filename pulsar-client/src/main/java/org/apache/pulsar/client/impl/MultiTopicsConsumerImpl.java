@@ -256,8 +256,10 @@ public class MultiTopicsConsumerImpl<T> extends ConsumerBase<T> {
                 log.debug("[{}] [{}] Receive message from sub consumer:{}",
                     topic, subscription, consumer.getTopic());
             }
+            int messagesCount = messages.size();
             // Process the message, add to the queue and trigger listener or async callback
             messages.forEach(msg -> messageReceived(consumer, msg));
+            messages.clear();
 
             int size = incomingMessages.size();
             int maxReceiverQueueSize = getCurrentReceiverQueueSize();
@@ -275,7 +277,7 @@ public class MultiTopicsConsumerImpl<T> extends ConsumerBase<T> {
             } else {
                 // Call receiveAsync() if the incoming queue is not full. Because this block is run with
                 // thenAcceptAsync, there is no chance for recursion that would lead to stack overflow.
-                receiveMessageFromConsumer(consumer, messages.size() > 0);
+                receiveMessageFromConsumer(consumer, messagesCount > 0);
             }
         }, internalPinnedExecutor).exceptionally(ex -> {
             if (ex instanceof PulsarClientException.AlreadyClosedException
