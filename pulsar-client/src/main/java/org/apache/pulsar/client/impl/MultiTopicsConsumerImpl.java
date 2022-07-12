@@ -249,7 +249,7 @@ public class MultiTopicsConsumerImpl<T> extends ConsumerBase<T> {
         if (batchReceive) {
             messagesFuture = consumer.batchReceiveAsync().thenApply(msgs -> ((MessagesImpl<T>) msgs).getMessageList());
         } else {
-            messagesFuture = consumer.receiveAsync().thenApply(Collections::singletonList);
+            messagesFuture = consumer.receiveAsync().thenApply(Lists::newArrayList);
         }
         messagesFuture.thenAcceptAsync(messages -> {
             if (log.isDebugEnabled()) {
