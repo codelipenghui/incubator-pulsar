@@ -82,9 +82,13 @@ jobs:
         with:
           maven-version: 3.6.1
 
-      - name: build and check license
+      - name: Check source code license headers
         if: ${{ steps.check_changes.outputs.docs_only != 'true' }}
-        run: mvn -q -B -ntp -DskipTests apache-rat:check initialize license:check install
+        run: mvn -B -T 8 -ntp initialize apache-rat:check license:check
+
+      - name: Build core-modules
+        run: |
+          mvn -B -T 1C -ntp -Pcore-modules,-main clean install -DskipTests -Dlicense.skip=true -Drat.skip=true
 
       - name: license check
         if: ${{ steps.check_changes.outputs.docs_only != 'true' }}
