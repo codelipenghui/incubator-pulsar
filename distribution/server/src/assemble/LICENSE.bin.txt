@@ -312,14 +312,14 @@ The Apache Software License, Version 2.0
  * JCommander -- com.beust-jcommander-1.78.jar
  * High Performance Primitive Collections for Java -- com.carrotsearch-hppc-0.7.3.jar
  * Jackson
-     - com.fasterxml.jackson.core-jackson-annotations-2.13.2.jar
-     - com.fasterxml.jackson.core-jackson-core-2.13.2.jar
-     - com.fasterxml.jackson.core-jackson-databind-2.13.2.1.jar
-     - com.fasterxml.jackson.dataformat-jackson-dataformat-yaml-2.13.2.jar
-     - com.fasterxml.jackson.jaxrs-jackson-jaxrs-base-2.13.2.jar
-     - com.fasterxml.jackson.jaxrs-jackson-jaxrs-json-provider-2.13.2.jar
-     - com.fasterxml.jackson.module-jackson-module-jaxb-annotations-2.13.2.jar
-     - com.fasterxml.jackson.module-jackson-module-jsonSchema-2.13.2.jar
+     - com.fasterxml.jackson.core-jackson-annotations-2.13.4.jar
+     - com.fasterxml.jackson.core-jackson-core-2.13.4.jar
+     - com.fasterxml.jackson.core-jackson-databind-2.13.4.jar
+     - com.fasterxml.jackson.dataformat-jackson-dataformat-yaml-2.13.4.jar
+     - com.fasterxml.jackson.jaxrs-jackson-jaxrs-base-2.13.4.jar
+     - com.fasterxml.jackson.jaxrs-jackson-jaxrs-json-provider-2.13.4.jar
+     - com.fasterxml.jackson.module-jackson-module-jaxb-annotations-2.13.4.jar
+     - com.fasterxml.jackson.module-jackson-module-jsonSchema-2.13.4.jar
  * Caffeine -- com.github.ben-manes.caffeine-caffeine-2.9.1.jar
  * Conscrypt -- org.conscrypt-conscrypt-openjdk-uber-2.5.2.jar
  * Proto Google Common Protos -- com.google.api.grpc-proto-google-common-protos-2.0.1.jar
@@ -449,7 +449,7 @@ The Apache Software License, Version 2.0
     - org.eclipse.jetty.websocket-websocket-servlet-9.4.48.v20220622.jar
     - org.eclipse.jetty-jetty-alpn-conscrypt-server-9.4.48.v20220622.jar
     - org.eclipse.jetty-jetty-alpn-server-9.4.48.v20220622.jar
- * SnakeYaml -- org.yaml-snakeyaml-1.31.jar
+ * SnakeYaml -- org.yaml-snakeyaml-1.32.jar
  * RocksDB - org.rocksdb-rocksdbjni-6.10.2.jar
  * Google Error Prone Annotations - com.google.errorprone-error_prone_annotations-2.5.1.jar
  * Apache Thrift - org.apache.thrift-libthrift-0.14.2.jar
@@ -538,6 +538,8 @@ The Apache Software License, Version 2.0
     - io.etcd-jetcd-core-0.5.11.jar
   * IPAddress
     - com.github.seancfoley-ipaddress-5.3.3.jar
+  * RoaringBitmap
+    - org.roaringbitmap-RoaringBitmap-0.9.15.jar
 
 BSD 3-clause "New" or "Revised" License
  * Google auth library
@@ -561,8 +563,8 @@ MIT License
 
 Protocol Buffers License
  * Protocol Buffers
-   - com.google.protobuf-protobuf-java-3.19.2.jar -- licenses/LICENSE-protobuf.txt
-   - com.google.protobuf-protobuf-java-util-3.19.2.jar -- licenses/LICENSE-protobuf.txt
+   - com.google.protobuf-protobuf-java-3.19.6.jar -- licenses/LICENSE-protobuf.txt
+   - com.google.protobuf-protobuf-java-util-3.19.6.jar -- licenses/LICENSE-protobuf.txt
 
 CDDL-1.1 -- licenses/LICENSE-CDDL-1.1.txt
  * Java Annotations API

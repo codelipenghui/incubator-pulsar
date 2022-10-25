@@ -89,7 +89,6 @@ import org.apache.pulsar.broker.loadbalance.LoadManager;
 import org.apache.pulsar.broker.loadbalance.LoadReportUpdaterTask;
 import org.apache.pulsar.broker.loadbalance.LoadResourceQuotaUpdaterTask;
 import org.apache.pulsar.broker.loadbalance.LoadSheddingTask;
-import org.apache.pulsar.broker.loadbalance.impl.LoadManagerShared;
 import org.apache.pulsar.broker.namespace.NamespaceService;
 import org.apache.pulsar.broker.protocol.ProtocolHandlers;
 import org.apache.pulsar.broker.resourcegroup.ResourceGroupService;
@@ -440,13 +439,6 @@ public class PulsarService implements AutoCloseable, ShutdownService {
                                                     * getConfiguration()
                                                     .getBrokerShutdownTimeoutMs())));
 
-            // shutdown loadmanager before shutting down the broker
-            executorServicesShutdown.shutdown(loadManagerExecutor);
-            LoadManager loadManager = this.loadManager.get();
-            if (loadManager != null) {
-                loadManager.stop();
-            }
-
             List<CompletableFuture<Void>> asyncCloseFutures = new ArrayList<>();
             if (this.brokerService != null) {
                 CompletableFuture<Void> brokerCloseFuture = this.brokerService.closeAsync();
@@ -481,6 +473,12 @@ public class PulsarService implements AutoCloseable, ShutdownService {
                 this.leaderElectionService = null;
             }
 
+            // cancel loadShedding task and shutdown the loadManager executor before shutting down the broker
+            if (this.loadSheddingTask != null) {
+                this.loadSheddingTask.cancel();
+            }
+            executorServicesShutdown.shutdown(loadManagerExecutor);
+
             if (adminClient != null) {
                 adminClient.close();
                 adminClient = null;
@@ -507,7 +505,10 @@ public class PulsarService implements AutoCloseable, ShutdownService {
             executorServicesShutdown.shutdown(orderedExecutor);
             executorServicesShutdown.shutdown(cacheExecutor);
 
-
+            LoadManager loadManager = this.loadManager.get();
+            if (loadManager != null) {
+                loadManager.stop();
+            }
 
             if (schemaRegistryService != null) {
                 schemaRegistryService.close();
@@ -1089,7 +1090,7 @@ public class PulsarService implements AutoCloseable, ShutdownService {
         if (config.isLoadBalancerEnabled()) {
             LOG.info("Starting load balancer");
             if (this.loadReportTask == null) {
-                long loadReportMinInterval = LoadManagerShared.LOAD_REPORT_UPDATE_MINIMUM_INTERVAL;
+                long loadReportMinInterval = config.getLoadBalancerReportUpdateMinIntervalMillis();
                 this.loadReportTask = this.loadManagerExecutor.scheduleAtFixedRate(
                         new LoadReportUpdaterTask(loadManager), loadReportMinInterval, loadReportMinInterval,
                         TimeUnit.MILLISECONDS);
