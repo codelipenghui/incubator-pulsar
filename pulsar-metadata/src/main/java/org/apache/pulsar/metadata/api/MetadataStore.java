@@ -219,13 +219,9 @@ public interface MetadataStore extends AutoCloseable {
      *            the custom serialization/deserialization object
      * @param cacheConfig
      *          the cache configuration to be used
-     * @deprecated use {@link #getMetadataCache(String, MetadataSerde, MetadataCacheConfig)}
      * @return the metadata cache object
      */
-    @Deprecated
-    default <T> MetadataCache<T> getMetadataCache(MetadataSerde<T> serde, MetadataCacheConfig cacheConfig) {
-        return getMetadataCache("serde", serde, cacheConfig);
-    }
+    <T> MetadataCache<T> getMetadataCache(MetadataSerde<T> serde, MetadataCacheConfig cacheConfig);
 
     /**
      * Create a metadata cache that uses a particular serde object.
@@ -237,19 +233,6 @@ public interface MetadataStore extends AutoCloseable {
      */
     default <T> MetadataCache<T> getMetadataCache(MetadataSerde<T> serde) {
         return getMetadataCache(serde, getDefaultMetadataCacheConfig());
-    }
-
-    /**
-     * Create a metadata cache that uses a particular serde object.
-     *
-     * @param <T>
-     * @param serde
-     *            the custom serialization/deserialization object
-     * @return the metadata cache object
-     */
-    default <T> MetadataCache<T> getMetadataCache(String cacheName, MetadataSerde<T> serde,
-                                                  MetadataCacheConfig cacheConfig) {
-        return getMetadataCache(serde, cacheConfig);
     }
 
     /**

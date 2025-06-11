@@ -16,12 +16,4 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.pulsar.common.stats;
-
-import lombok.experimental.UtilityClass;
-
-@UtilityClass
-public class CacheMetricsCollector {
-    public static final io.prometheus.client.cache.caffeine.CacheMetricsCollector CAFFEINE =
-        new io.prometheus.client.cache.caffeine.CacheMetricsCollector().register();
-}
+package org.apache.pulsar.stats;

@@ -43,7 +43,6 @@ import java.util.concurrent.TimeUnit;
 import javax.naming.AuthenticationException;
 import org.apache.pulsar.broker.ServiceConfiguration;
 import org.apache.pulsar.broker.authentication.AuthenticationProvider;
-import org.apache.pulsar.common.stats.CacheMetricsCollector;
 import org.asynchttpclient.AsyncHttpClient;
 import org.jspecify.annotations.NonNull;
 
@@ -82,7 +81,6 @@ class OpenIDProviderMetadataCache {
                 .refreshAfterWrite(refreshAfterWriteSeconds, TimeUnit.SECONDS)
                 .expireAfterWrite(expireAfterSeconds, TimeUnit.SECONDS)
                 .buildAsync(loader);
-        CacheMetricsCollector.CAFFEINE.addCache("open-id-provider-metadata", cache);
     }
 
     /**
