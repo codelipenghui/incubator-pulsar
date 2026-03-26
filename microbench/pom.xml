@@ -96,6 +96,11 @@
       <artifactId>pulsar-broker</artifactId>
       <version>${project.version}</version>
     </dependency>
+    <dependency>
+      <groupId>${project.groupId}</groupId>
+      <artifactId>tiered-storage-jcloud</artifactId>
+      <version>${project.version}</version>
+    </dependency>
   </dependencies>
 
   <build>

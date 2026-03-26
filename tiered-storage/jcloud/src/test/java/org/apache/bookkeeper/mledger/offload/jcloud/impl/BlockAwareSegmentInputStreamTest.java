@@ -803,6 +803,78 @@ public class BlockAwareSegmentInputStreamTest {
         inputStream.close();
     }
 
+    @Test(dataProvider = "useBufferRead")
+    public void testGetEntryOffsets(boolean useBufferRead) throws Exception {
+        int ledgerId = 1;
+        int entrySize = 8;
+        int lac = 4;
+        ReadHandle readHandle = new MockReadHandle(ledgerId, entrySize, lac);
+
+        // block size big enough to hold all 5 entries (entry 0..4), plus some padding
+        int entryTotalSize = entrySize + BlockAwareSegmentInputStreamImpl.ENTRY_HEADER_SIZE; // 8 + 12 = 20
+        int blockSize = DataBlockHeaderImpl.getDataStartOffset() + (lac + 1) * entryTotalSize + 10; // padding of 10
+        BlockAwareSegmentInputStreamImpl inputStream = new BlockAwareSegmentInputStreamImpl(readHandle, 0, blockSize);
+
+        // Drain the entire stream
+        byte[] buf = new byte[blockSize];
+        if (useBufferRead) {
+            int offset = 0;
+            int ret;
+            while ((ret = inputStream.read(buf, offset, buf.length - offset)) > 0) {
+                offset += ret;
+            }
+        } else {
+            for (int i = 0; i < blockSize; i++) {
+                int ret = inputStream.read();
+                if (ret == -1) {
+                    break;
+                }
+            }
+        }
+
+        // Verify entry offsets
+        List<long[]> offsets = inputStream.getEntryOffsets();
+        assertEquals(offsets.size(), lac + 1, "Should have captured offsets for all entries");
+
+        int headerSize = DataBlockHeaderImpl.getDataStartOffset(); // 128
+        for (int i = 0; i <= lac; i++) {
+            long[] entry = offsets.get(i);
+            assertEquals(entry[0], i, "Entry id should match");
+            long expectedOffset = headerSize + (long) i * entryTotalSize;
+            assertEquals(entry[1], expectedOffset,
+                "Entry " + i + " offset should be header + i * entryTotalSize");
+        }
+
+        inputStream.close();
+    }
+
+    @Test
+    public void testGetEntryOffsetsEmpty() throws Exception {
+        // When no entries fit in the block, offsets should be empty
+        int ledgerId = 1;
+        int entrySize = 1000;
+        int lac = 1;
+        ReadHandle readHandle = new MockReadHandle(ledgerId, entrySize, lac);
+
+        // block size too small for any entry
+        int blockSize = DataBlockHeaderImpl.getDataStartOffset() + entrySize;
+        BlockAwareSegmentInputStreamImpl inputStream = new BlockAwareSegmentInputStreamImpl(readHandle, 0, blockSize);
+
+        // Drain the stream
+        byte[] buf = new byte[blockSize];
+        int offset = 0;
+        int ret;
+        while ((ret = inputStream.read(buf, offset, buf.length - offset)) > 0) {
+            offset += ret;
+        }
+
+        List<long[]> offsets = inputStream.getEntryOffsets();
+        assertEquals(offsets.size(), 0, "No entries should have been captured");
+        assertEquals(inputStream.getBlockEntryCount(), 0);
+
+        inputStream.close();
+    }
+
     @Test
     public void testCloseReleaseResources() throws Exception {
         ReadHandle readHandle = new MockReadHandle(1, 10, 10);

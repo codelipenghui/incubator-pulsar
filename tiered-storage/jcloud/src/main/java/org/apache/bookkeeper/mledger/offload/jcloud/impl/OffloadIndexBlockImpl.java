@@ -47,11 +47,14 @@ public class OffloadIndexBlockImpl implements OffloadIndexBlock {
     private static final Logger log = LoggerFactory.getLogger(OffloadIndexBlockImpl.class);
 
     private static final int INDEX_MAGIC_WORD = 0xDE47DE47;
+    private static final int ENTRY_INDEX_DIRECTORY_MAGIC = 0xE1D3E1D3;
 
     private LedgerMetadata segmentMetadata;
     private long dataObjectLength;
     private long dataHeaderLength;
     private TreeMap<Long, OffloadIndexEntryImpl> indexEntries;
+    // Per-entry offsets: maps blockFirstEntryId -> list of [entryId, offset] pairs
+    private TreeMap<Long, List<long[]>> perEntryOffsets;
 
     private final Handle<OffloadIndexBlockImpl> recyclerHandle;
 
@@ -90,12 +93,24 @@ public class OffloadIndexBlockImpl implements OffloadIndexBlock {
         return block;
     }
 
+    /**
+     * Set per-entry offsets for fine-grained index.
+     * @param perEntryOffsets map of blockFirstEntryId to list of [entryId, offset] pairs
+     */
+    public void setPerEntryOffsets(TreeMap<Long, List<long[]>> perEntryOffsets) {
+        this.perEntryOffsets = new TreeMap<>(perEntryOffsets);
+    }
+
     public void recycle() {
         dataObjectLength = -1;
         dataHeaderLength = -1;
         segmentMetadata = null;
         indexEntries.clear();
         indexEntries = null;
+        if (perEntryOffsets != null) {
+            perEntryOffsets.clear();
+            perEntryOffsets = null;
+        }
         if (recyclerHandle != null) {
             recyclerHandle.recycle(this);
         }
@@ -138,6 +153,11 @@ public class OffloadIndexBlockImpl implements OffloadIndexBlock {
      * Read out in format:
      *   | index_magic_header | index_block_len | data_object_len | data_header_len |
      *   | index_entry_count  | segment_metadata_len | segment metadata | index entries... |
+     *
+     * When per-entry offsets are present, the following is appended:
+     *   | entry_index_directory_magic (4B) |
+     *   | directory entries: [firstEntryId(8B) | sectionOffset(8B) | sectionLength(4B)] x N |
+     *   | per-entry sections: [entryCount(4B) | [entryId(8B) | offset(8B)] x entryCount] x N |
      */
     @Override
     public OffloadIndexBlock.IndexInputStream toStream() throws IOException {
@@ -154,7 +174,23 @@ public class OffloadIndexBlockImpl implements OffloadIndexBlock {
             + segmentMetadataLength
             + indexEntryCount * (8 + 4 + 8); /* messageEntryId + blockPartId + blockOffset */
 
-        ByteBuf out = PulsarByteBufAllocator.DEFAULT.buffer(indexBlockLength, indexBlockLength);
+        // Calculate per-entry index size if present
+        int perEntrySize = 0;
+        boolean hasPerEntryOffsets = perEntryOffsets != null && !perEntryOffsets.isEmpty();
+        if (hasPerEntryOffsets) {
+            // Directory: magic(4B) + N * (firstEntryId(8B) + sectionOffset(8B) + sectionLength(4B))
+            perEntrySize += 4; // directory magic
+            perEntrySize += perEntryOffsets.size() * (8 + 8 + 4); // directory entries
+
+            // Per-entry sections: for each block, entryCount(4B) + entries * (entryId(8B) + offset(8B))
+            for (Map.Entry<Long, List<long[]>> entry : perEntryOffsets.entrySet()) {
+                perEntrySize += 4; // entryCount
+                perEntrySize += entry.getValue().size() * (8 + 8); // entryId + offset per entry
+            }
+        }
+
+        int totalSize = indexBlockLength + perEntrySize;
+        ByteBuf out = PulsarByteBufAllocator.DEFAULT.buffer(totalSize, totalSize);
 
         out.writeInt(INDEX_MAGIC_WORD)
             .writeInt(indexBlockLength)
@@ -165,13 +201,44 @@ public class OffloadIndexBlockImpl implements OffloadIndexBlock {
         // write metadata
         out.writeBytes(ledgerMetadataByte);
 
-        // write entries
+        // write block-level entries
         this.indexEntries.entrySet().forEach(entry ->
                 out.writeLong(entry.getValue().getEntryId())
                 .writeInt(entry.getValue().getPartId())
                 .writeLong(entry.getValue().getOffset()));
 
-        return new OffloadIndexBlock.IndexInputStream(new ByteBufInputStream(out, true), indexBlockLength);
+        // write per-entry index if present
+        if (hasPerEntryOffsets) {
+            // Write directory magic
+            out.writeInt(ENTRY_INDEX_DIRECTORY_MAGIC);
+
+            // Pre-compute section offsets. Sections start after the directory.
+            // Directory ends at: indexBlockLength + 4(magic) + N * 20(directory entries)
+            int directorySize = 4 + perEntryOffsets.size() * 20;
+            long sectionStart = indexBlockLength + directorySize;
+
+            // Write directory entries and compute section offsets/lengths
+            long currentSectionOffset = sectionStart;
+            for (Map.Entry<Long, List<long[]>> entry : perEntryOffsets.entrySet()) {
+                int sectionLength = 4 + entry.getValue().size() * 16; // entryCount + entries
+                out.writeLong(entry.getKey());          // firstEntryId
+                out.writeLong(currentSectionOffset);    // sectionOffset (absolute in blob)
+                out.writeInt(sectionLength);             // sectionLength
+                currentSectionOffset += sectionLength;
+            }
+
+            // Write per-entry sections
+            for (Map.Entry<Long, List<long[]>> entry : perEntryOffsets.entrySet()) {
+                List<long[]> pairs = entry.getValue();
+                out.writeInt(pairs.size()); // entryCount
+                for (long[] pair : pairs) {
+                    out.writeLong(pair[0]); // entryId
+                    out.writeLong(pair[1]); // offset
+                }
+            }
+        }
+
+        return new OffloadIndexBlock.IndexInputStream(new ByteBufInputStream(out, true), totalSize);
     }
 
     private static class InternalLedgerMetadata implements LedgerMetadata {
@@ -351,6 +418,10 @@ public class OffloadIndexBlockImpl implements OffloadIndexBlock {
 
     public static int getIndexMagicWord() {
         return INDEX_MAGIC_WORD;
+    }
+
+    public static int getEntryIndexDirectoryMagic() {
+        return ENTRY_INDEX_DIRECTORY_MAGIC;
     }
 
     @Override

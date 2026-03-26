@@ -84,7 +84,7 @@ public class BlobStoreManagedLedgerOffloaderStreamingTest extends BlobStoreManag
         Mockito.doReturn(blobStore).when(mockedConfig).getBlobStore(); // Use the REAL blobStore
         BlobStoreManagedLedgerOffloader offloader = BlobStoreManagedLedgerOffloader
                 .create(mockedConfig, new HashMap<String, String>(), scheduler, scheduler,
-                        this.offloaderStats, entryOffsetsCache);
+                        this.offloaderStats, entryOffsetsCache, null);
         return offloader;
     }
 
@@ -94,7 +94,7 @@ public class BlobStoreManagedLedgerOffloaderStreamingTest extends BlobStoreManag
         Mockito.doReturn(mockedBlobStore).when(mockedConfig).getBlobStore();
         BlobStoreManagedLedgerOffloader offloader = BlobStoreManagedLedgerOffloader
                 .create(mockedConfig, new HashMap<String, String>(), scheduler, scheduler,
-                        this.offloaderStats, entryOffsetsCache);
+                        this.offloaderStats, entryOffsetsCache, null);
         return offloader;
     }
 

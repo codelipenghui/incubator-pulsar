@@ -201,6 +201,14 @@ public class OffloadPoliciesImpl implements Serializable, OffloadPolicies {
     @JsonProperty(access = JsonProperty.Access.READ_WRITE)
     private Integer managedLedgerOffloadReadBufferSizeInBytes;
 
+    @Configuration
+    @JsonProperty(access = JsonProperty.Access.READ_WRITE)
+    private Integer managedLedgerOffloadChunkCacheSizeInMB;
+
+    @Configuration
+    @JsonProperty(access = JsonProperty.Access.READ_WRITE)
+    private Integer managedLedgerOffloadChunkCacheTTLInSeconds;
+
     public static OffloadPoliciesImpl create(String driver, String region, String bucket, String endpoint,
                                              String role, String roleSessionName,
                                              String credentialId, String credentialSecret,
@@ -658,6 +666,18 @@ public class OffloadPoliciesImpl implements Serializable, OffloadPolicies {
         public OffloadPoliciesImplBuilder managedLedgerOffloadReadBufferSizeInBytes(
                 Integer managedLedgerOffloadReadBufferSizeInBytes) {
             impl.managedLedgerOffloadReadBufferSizeInBytes = managedLedgerOffloadReadBufferSizeInBytes;
+            return this;
+        }
+
+        public OffloadPoliciesImplBuilder managedLedgerOffloadChunkCacheSizeInMB(
+                Integer managedLedgerOffloadChunkCacheSizeInMB) {
+            impl.managedLedgerOffloadChunkCacheSizeInMB = managedLedgerOffloadChunkCacheSizeInMB;
+            return this;
+        }
+
+        public OffloadPoliciesImplBuilder managedLedgerOffloadChunkCacheTTLInSeconds(
+                Integer managedLedgerOffloadChunkCacheTTLInSeconds) {
+            impl.managedLedgerOffloadChunkCacheTTLInSeconds = managedLedgerOffloadChunkCacheTTLInSeconds;
             return this;
         }
 

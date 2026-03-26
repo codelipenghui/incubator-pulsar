@@ -21,6 +21,7 @@ package org.apache.bookkeeper.mledger.offload.jcloud.impl;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -63,6 +64,13 @@ public class OffsetsCache implements AutoCloseable {
     public void put(long ledgerId, long entryId, long currentPosition) {
         if (entryOffsetsCache != null) {
             entryOffsetsCache.put(new Key(ledgerId, entryId), currentPosition);
+        }
+    }
+
+    public void bulkPut(long ledgerId, Map<Long, Long> entryOffsets) {
+        if (entryOffsetsCache != null) {
+            entryOffsets.forEach((entryId, offset) ->
+                entryOffsetsCache.put(new Key(ledgerId, entryId), offset));
         }
     }
 

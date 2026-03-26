@@ -23,6 +23,7 @@ import java.io.InputStream;
 import org.apache.bookkeeper.client.api.LedgerMetadata;
 import org.apache.bookkeeper.common.annotation.InterfaceAudience.LimitedPrivate;
 import org.apache.bookkeeper.common.annotation.InterfaceStability.Unstable;
+import org.apache.bookkeeper.mledger.offload.jcloud.impl.OffsetsCache;
 import org.apache.bookkeeper.mledger.offload.jcloud.impl.OffloadIndexBlockV2BuilderImpl;
 
 /**
@@ -52,6 +53,15 @@ public interface OffloadIndexBlockBuilder {
     OffloadIndexBlockBuilder addBlock(long firstEntryId, int partId, int blockSize);
 
     /**
+     * Record the absolute byte offset in the data object for a single entry.
+     * Must be called after the {@link #addBlock} call that contains this entry.
+     *
+     * @param entryId the entry id
+     * @param offset  absolute byte offset in the data object where the entry's 4-byte length field begins
+     */
+    OffloadIndexBlockBuilder addEntryOffset(long entryId, long offset);
+
+    /**
      * Specify the length of data object this index is associated with.
      * @param dataObjectLength the length of the data object
      */
@@ -72,6 +82,17 @@ public interface OffloadIndexBlockBuilder {
      * Construct OffloadIndex from an InputStream.
      */
     OffloadIndexBlockV2 fromStream(InputStream is) throws IOException;
+
+    /**
+     * Construct OffloadIndex from an InputStream, parsing any per-entry index data
+     * and bulk-loading it into the provided OffsetsCache.
+     *
+     * @param is the input stream containing the serialized index
+     * @param ledgerId the ledger ID to associate with cached offsets
+     * @param offsetsCache the cache to populate with per-entry offsets
+     * @return the deserialized OffloadIndexBlock
+     */
+    OffloadIndexBlock fromStream(InputStream is, long ledgerId, OffsetsCache offsetsCache) throws IOException;
 
     /**
      * create an OffloadIndexBlockBuilder.

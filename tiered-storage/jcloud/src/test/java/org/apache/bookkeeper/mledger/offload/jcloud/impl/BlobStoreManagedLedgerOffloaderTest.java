@@ -28,7 +28,10 @@ import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.fail;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -43,6 +46,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import lombok.Cleanup;
 import org.apache.bookkeeper.client.BKException;
+import org.apache.bookkeeper.client.BookKeeper;
+import org.apache.bookkeeper.client.LedgerHandle;
+import org.apache.bookkeeper.client.api.DigestType;
 import org.apache.bookkeeper.client.api.LedgerEntries;
 import org.apache.bookkeeper.client.api.LedgerEntry;
 import org.apache.bookkeeper.client.api.ReadHandle;
@@ -51,11 +57,16 @@ import org.apache.bookkeeper.mledger.LedgerOffloaderStats;
 import org.apache.bookkeeper.mledger.ManagedLedgerException;
 import org.apache.bookkeeper.mledger.OffloadedLedgerMetadata;
 import org.apache.bookkeeper.mledger.impl.LedgerOffloaderStatsImpl;
+import org.apache.bookkeeper.mledger.offload.jcloud.OffloadIndexBlock;
+import org.apache.bookkeeper.mledger.offload.jcloud.OffloadIndexBlockBuilder;
 import org.apache.bookkeeper.mledger.offload.jcloud.provider.JCloudBlobStoreProvider;
 import org.apache.bookkeeper.mledger.offload.jcloud.provider.TieredStorageConfiguration;
 import org.apache.pulsar.common.naming.TopicName;
 import org.jclouds.blobstore.BlobStore;
+import org.jclouds.blobstore.domain.Blob;
+import org.jclouds.blobstore.domain.BlobBuilder;
 import org.jclouds.blobstore.options.CopyOptions;
+import org.jclouds.io.Payloads;
 import org.mockito.Mockito;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -101,7 +112,7 @@ public class BlobStoreManagedLedgerOffloaderTest extends BlobStoreManagedLedgerO
         Mockito.doReturn(blobStore).when(mockedConfig).getBlobStore(); // Use the REAL blobStore
         BlobStoreManagedLedgerOffloader offloader = BlobStoreManagedLedgerOffloader.create(mockedConfig,
                 new HashMap<String, String>(), scheduler, scheduler, this.offloaderStats,
-                entryOffsetsCache);
+                entryOffsetsCache, null);
         return offloader;
     }
 
@@ -110,7 +121,7 @@ public class BlobStoreManagedLedgerOffloaderTest extends BlobStoreManagedLedgerO
         Mockito.doReturn(mockedBlobStore).when(mockedConfig).getBlobStore();
         BlobStoreManagedLedgerOffloader offloader = BlobStoreManagedLedgerOffloader.create(mockedConfig,
                 new HashMap<String, String>(), scheduler, scheduler, this.offloaderStats,
-                entryOffsetsCache);
+                entryOffsetsCache, null);
         return offloader;
     }
 
@@ -692,6 +703,263 @@ public class BlobStoreManagedLedgerOffloaderTest extends BlobStoreManagedLedgerO
             fail("Should be read fail");
         } catch (BKException e) {
             assertEquals(e.getCode(), NoSuchLedgerExistsException);
+        }
+    }
+
+    // ---- Helper for integration tests that need the new ChunkCache read path ----
+
+    private BlobStoreManagedLedgerOffloader getOffloaderWithChunkCache(int chunkSize) throws IOException {
+        mockedConfig = mock(TieredStorageConfiguration.class, delegatesTo(getConfiguration(BUCKET)));
+        Mockito.doReturn(blobStore).when(mockedConfig).getBlobStore();
+        // Create a ChunkCache with generous limits for testing
+        ChunkCache cache = new ChunkCache(
+                64 * 1024 * 1024, // 64 MB max cache
+                300,              // 5 minutes TTL
+                chunkSize);
+        BlobStoreManagedLedgerOffloader offloader = BlobStoreManagedLedgerOffloader.create(mockedConfig,
+                new HashMap<String, String>(), scheduler, scheduler, this.offloaderStats,
+                entryOffsetsCache, cache);
+        return offloader;
+    }
+
+    // ---- End-to-end integration tests for the new cache design ----
+
+    /**
+     * Test the full offload-then-read cycle with per-entry index and ChunkCache.
+     *
+     * 1. Offloads a ledger (writes per-entry offsets into the index).
+     * 2. Opens a read handle with a real ChunkCache (enables the new read path).
+     * 3. Reads all entries and verifies they match the original data.
+     *
+     * This validates: write per-entry offsets -> read index -> bulk-load OffsetsCache
+     *   -> read entries via chunk cache path.
+     */
+    @Test(timeOut = 600000)
+    public void testOffloadAndReadWithPerEntryIndex() throws Exception {
+        // Use a chunkSize large enough to hold multiple entries so that
+        // the read path goes through the chunk cache rather than direct fetch.
+        int chunkSize = 1 * 1024 * 1024; // 1 MB
+        @Cleanup
+        ReadHandle toWrite = buildReadHandle(DEFAULT_BLOCK_SIZE, 3);
+        @Cleanup
+        LedgerOffloader offloader = getOffloaderWithChunkCache(chunkSize);
+
+        UUID uuid = UUID.randomUUID();
+        offloader.offload(toWrite, uuid, new HashMap<>()).get();
+
+        // Verify that per-entry offsets were bulk-loaded into OffsetsCache during index read
+        @Cleanup
+        ReadHandle toTest = offloader.readOffloaded(toWrite.getId(), uuid, Collections.emptyMap()).get();
+        assertEquals(toTest.getLastAddConfirmed(), toWrite.getLastAddConfirmed());
+
+        // The OffsetsCache should now contain entries from the per-entry index
+        // (bulk-loaded during fromStream). Verify a sample entry is cached.
+        Long cachedOffset = entryOffsetsCache.getIfPresent(toWrite.getId(), 0);
+        assertNotNull(cachedOffset, "Entry 0 offset should have been bulk-loaded into OffsetsCache");
+
+        // Read all entries and verify data correctness
+        try (LedgerEntries toWriteEntries = toWrite.read(0, toWrite.getLastAddConfirmed());
+             LedgerEntries toTestEntries = toTest.read(0, toTest.getLastAddConfirmed())) {
+            Iterator<LedgerEntry> toWriteIter = toWriteEntries.iterator();
+            Iterator<LedgerEntry> toTestIter = toTestEntries.iterator();
+
+            while (toWriteIter.hasNext() && toTestIter.hasNext()) {
+                LedgerEntry toWriteEntry = toWriteIter.next();
+                LedgerEntry toTestEntry = toTestIter.next();
+
+                assertEquals(toWriteEntry.getLedgerId(), toTestEntry.getLedgerId());
+                assertEquals(toWriteEntry.getEntryId(), toTestEntry.getEntryId());
+                assertEquals(toWriteEntry.getLength(), toTestEntry.getLength());
+                assertEquals(toWriteEntry.getEntryBuffer(), toTestEntry.getEntryBuffer());
+            }
+            Assert.assertFalse(toWriteIter.hasNext());
+            Assert.assertFalse(toTestIter.hasNext());
+        }
+
+        // Also verify random access reads work correctly with the new path
+        long mid = toWrite.getLastAddConfirmed() / 2;
+        try (LedgerEntries toWriteEntries = toWrite.read(mid, mid + 1);
+             LedgerEntries toTestEntries = toTest.read(mid, mid + 1)) {
+            Iterator<LedgerEntry> toWriteIter = toWriteEntries.iterator();
+            Iterator<LedgerEntry> toTestIter = toTestEntries.iterator();
+
+            while (toWriteIter.hasNext() && toTestIter.hasNext()) {
+                LedgerEntry toWriteEntry = toWriteIter.next();
+                LedgerEntry toTestEntry = toTestIter.next();
+
+                assertEquals(toWriteEntry.getLedgerId(), toTestEntry.getLedgerId());
+                assertEquals(toWriteEntry.getEntryId(), toTestEntry.getEntryId());
+                assertEquals(toWriteEntry.getEntryBuffer(), toTestEntry.getEntryBuffer());
+            }
+            Assert.assertFalse(toWriteIter.hasNext());
+            Assert.assertFalse(toTestIter.hasNext());
+        }
+    }
+
+    /**
+     * Test backward compatibility: read old-format index (without per-entry offsets)
+     * using the new code path with ChunkCache.
+     *
+     * 1. Offloads data normally (producing data blocks in the blob store).
+     * 2. Replaces the index blob with one that has NO per-entry offsets (old format).
+     * 3. Opens a read handle with the new code (ChunkCache enabled).
+     * 4. Reads entries — the new code must fall back to scanning through ChunkCache.
+     * 5. Verifies all entries match.
+     */
+    @Test(timeOut = 600000)
+    public void testReadOldFormatIndexWithNewCode() throws Exception {
+        int chunkSize = 1 * 1024 * 1024; // 1 MB
+        @Cleanup
+        ReadHandle toWrite = buildReadHandle(DEFAULT_BLOCK_SIZE, 1);
+        @Cleanup
+        BlobStoreManagedLedgerOffloader offloader = getOffloaderWithChunkCache(chunkSize);
+
+        UUID uuid = UUID.randomUUID();
+        offloader.offload(toWrite, uuid, new HashMap<>()).get();
+
+        // Now read the current index blob, rebuild it WITHOUT per-entry offsets,
+        // and replace it in the blob store.
+        String indexKey = DataBlockUtils.indexBlockOffloadKey(toWrite.getId(), uuid);
+
+        // Build an old-format index that has only block-level entries (no per-entry offsets).
+        // We do this by reading the existing index, then rebuilding without calling addEntryOffset().
+        // First, read the existing index to get block-level information.
+        @Cleanup("close")
+        ReadHandle tempRead = offloader.readOffloaded(toWrite.getId(), uuid, Collections.emptyMap()).get();
+        BlobStoreBackedReadHandleImpl tempImpl = (BlobStoreBackedReadHandleImpl) tempRead;
+        long lac = tempRead.getLastAddConfirmed();
+
+        // Build a fresh index with only block-level entries (mimicking old format)
+        OffloadIndexBlockBuilder oldFormatBuilder = OffloadIndexBlockBuilder.create()
+                .withLedgerMetadata(toWrite.getLedgerMetadata())
+                .withDataBlockHeaderLength(BlockAwareSegmentInputStreamImpl.getHeaderSize());
+
+        // Re-read data to figure out block boundaries.
+        // We know the original offload used DEFAULT_BLOCK_SIZE with 1 block.
+        // Reconstruct by computing the data object length from the offloaded data.
+        Blob dataBlob = blobStore.getBlob(BUCKET, DataBlockUtils.dataBlockOffloadKey(toWrite.getId(), uuid));
+        long dataObjectLength = dataBlob.getMetadata().getContentMetadata().getContentLength();
+
+        oldFormatBuilder.addBlock(0, 1, (int) dataObjectLength);
+        // Intentionally NOT calling addEntryOffset() — this simulates the old format
+        OffloadIndexBlock oldFormatIndex = oldFormatBuilder.withDataObjectLength(dataObjectLength).build();
+        OffloadIndexBlock.IndexInputStream oldIndexStream = oldFormatIndex.toStream();
+
+        // Read out the old-format index bytes
+        byte[] oldIndexBytes;
+        try (InputStream is = oldIndexStream) {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = is.read(buf)) != -1) {
+                baos.write(buf, 0, n);
+            }
+            oldIndexBytes = baos.toByteArray();
+        }
+        oldFormatIndex.close();
+
+        // Replace the index blob in the store with the old-format version
+        Map<String, String> existingMeta = new HashMap<>(
+                blobStore.blobMetadata(BUCKET, indexKey).getUserMetadata());
+        // Remove version key since addVersionInfo will re-add it (avoids duplicate key in ImmutableMap)
+        existingMeta.remove(DataBlockUtils.METADATA_FORMAT_VERSION_KEY.toLowerCase());
+        BlobBuilder blobBuilder = blobStore.blobBuilder(indexKey);
+        DataBlockUtils.addVersionInfo(blobBuilder, existingMeta);
+        Blob replacementBlob = blobBuilder
+                .payload(Payloads.newByteArrayPayload(oldIndexBytes))
+                .contentLength((long) oldIndexBytes.length)
+                .build();
+        blobStore.putBlob(BUCKET, replacementBlob);
+
+        // Clear the offsets cache so the new read path cannot use previously cached offsets
+        entryOffsetsCache.clear();
+
+        // Now open a read handle with the new code — should fall back to scan path
+        @Cleanup
+        ReadHandle toTest = offloader.readOffloaded(toWrite.getId(), uuid, Collections.emptyMap()).get();
+        assertEquals(toTest.getLastAddConfirmed(), toWrite.getLastAddConfirmed());
+
+        // Read all entries and verify correctness (scan-through-chunk-cache fallback)
+        try (LedgerEntries toWriteEntries = toWrite.read(0, toWrite.getLastAddConfirmed());
+             LedgerEntries toTestEntries = toTest.read(0, toTest.getLastAddConfirmed())) {
+            Iterator<LedgerEntry> toWriteIter = toWriteEntries.iterator();
+            Iterator<LedgerEntry> toTestIter = toTestEntries.iterator();
+
+            while (toWriteIter.hasNext() && toTestIter.hasNext()) {
+                LedgerEntry toWriteEntry = toWriteIter.next();
+                LedgerEntry toTestEntry = toTestIter.next();
+
+                assertEquals(toWriteEntry.getLedgerId(), toTestEntry.getLedgerId());
+                assertEquals(toWriteEntry.getEntryId(), toTestEntry.getEntryId());
+                assertEquals(toWriteEntry.getLength(), toTestEntry.getLength());
+                assertEquals(toWriteEntry.getEntryBuffer(), toTestEntry.getEntryBuffer());
+            }
+            Assert.assertFalse(toWriteIter.hasNext());
+            Assert.assertFalse(toTestIter.hasNext());
+        }
+    }
+
+    /**
+     * Test that large reads bypass the ChunkCache and use direct fetch instead.
+     *
+     * 1. Offloads a ledger with many entries spanning multiple blocks.
+     * 2. Configures a small ChunkCache chunkSize (e.g. 64KB) so that reading a
+     *    range of entries whose total size exceeds the chunkSize triggers the direct fetch path.
+     * 3. Reads a range of entries and verifies all data matches.
+     */
+    @Test(timeOut = 600000)
+    public void testLargeReadBypassesChunkCache() throws Exception {
+        // Use a very small chunk size so that reading many entries will exceed it
+        // and trigger the direct-fetch path (totalBytes > chunkSize).
+        int smallChunkSize = 64 * 1024; // 64 KB
+        @Cleanup
+        ReadHandle toWrite = buildReadHandle(DEFAULT_BLOCK_SIZE, 3);
+        @Cleanup
+        LedgerOffloader offloader = getOffloaderWithChunkCache(smallChunkSize);
+
+        UUID uuid = UUID.randomUUID();
+        offloader.offload(toWrite, uuid, new HashMap<>()).get();
+
+        @Cleanup
+        ReadHandle toTest = offloader.readOffloaded(toWrite.getId(), uuid, Collections.emptyMap()).get();
+        assertEquals(toTest.getLastAddConfirmed(), toWrite.getLastAddConfirmed());
+
+        // Read a large range that spans many entries — total bytes should exceed 64KB chunkSize,
+        // forcing the direct fetch path.
+        long lastEntry = toWrite.getLastAddConfirmed();
+        assertTrue(lastEntry > 10, "Expected more than 10 entries for this test to be meaningful");
+
+        try (LedgerEntries toWriteEntries = toWrite.read(0, lastEntry);
+             LedgerEntries toTestEntries = toTest.read(0, lastEntry)) {
+            Iterator<LedgerEntry> toWriteIter = toWriteEntries.iterator();
+            Iterator<LedgerEntry> toTestIter = toTestEntries.iterator();
+
+            int count = 0;
+            while (toWriteIter.hasNext() && toTestIter.hasNext()) {
+                LedgerEntry toWriteEntry = toWriteIter.next();
+                LedgerEntry toTestEntry = toTestIter.next();
+
+                assertEquals(toWriteEntry.getLedgerId(), toTestEntry.getLedgerId());
+                assertEquals(toWriteEntry.getEntryId(), toTestEntry.getEntryId());
+                assertEquals(toWriteEntry.getLength(), toTestEntry.getLength());
+                assertEquals(toWriteEntry.getEntryBuffer(), toTestEntry.getEntryBuffer());
+                count++;
+            }
+            Assert.assertFalse(toWriteIter.hasNext());
+            Assert.assertFalse(toTestIter.hasNext());
+            assertEquals(count, lastEntry + 1);
+        }
+
+        // Also verify that reading a small range (few entries) still works
+        // — this will go through the chunk cache path since total bytes < chunkSize.
+        try (LedgerEntries toWriteEntries = toWrite.read(0, 0);
+             LedgerEntries toTestEntries = toTest.read(0, 0)) {
+            Iterator<LedgerEntry> toWriteIter = toWriteEntries.iterator();
+            Iterator<LedgerEntry> toTestIter = toTestEntries.iterator();
+
+            LedgerEntry toWriteEntry = toWriteIter.next();
+            LedgerEntry toTestEntry = toTestIter.next();
+            assertEquals(toWriteEntry.getEntryBuffer(), toTestEntry.getEntryBuffer());
         }
     }
 }

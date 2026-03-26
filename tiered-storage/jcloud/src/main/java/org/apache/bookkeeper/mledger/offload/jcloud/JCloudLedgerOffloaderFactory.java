@@ -25,6 +25,7 @@ import org.apache.bookkeeper.mledger.LedgerOffloaderFactory;
 import org.apache.bookkeeper.mledger.LedgerOffloaderStats;
 import org.apache.bookkeeper.mledger.LedgerOffloaderStatsDisable;
 import org.apache.bookkeeper.mledger.offload.jcloud.impl.BlobStoreManagedLedgerOffloader;
+import org.apache.bookkeeper.mledger.offload.jcloud.impl.ChunkCache;
 import org.apache.bookkeeper.mledger.offload.jcloud.impl.OffsetsCache;
 import org.apache.bookkeeper.mledger.offload.jcloud.provider.JCloudBlobStoreProvider;
 import org.apache.bookkeeper.mledger.offload.jcloud.provider.TieredStorageConfiguration;
@@ -35,6 +36,7 @@ import org.apache.pulsar.common.policies.data.OffloadPoliciesImpl;
  */
 public class JCloudLedgerOffloaderFactory implements LedgerOffloaderFactory<BlobStoreManagedLedgerOffloader> {
     private final OffsetsCache entryOffsetsCache = new OffsetsCache();
+    private volatile ChunkCache chunkCache; // lazy-init, volatile for thread safety
 
     @Override
     public boolean isDriverSupported(String driverName) {
@@ -54,8 +56,9 @@ public class JCloudLedgerOffloaderFactory implements LedgerOffloaderFactory<Blob
 
         TieredStorageConfiguration config =
                 TieredStorageConfiguration.create(offloadPolicies.toProperties());
+        ChunkCache cache = getOrCreateChunkCache(config);
         return BlobStoreManagedLedgerOffloader.create(config, userMetadata, scheduler, scheduler, offloaderStats,
-                entryOffsetsCache);
+                entryOffsetsCache, cache);
     }
 
     @Override
@@ -66,12 +69,30 @@ public class JCloudLedgerOffloaderFactory implements LedgerOffloaderFactory<Blob
 
         TieredStorageConfiguration config =
                 TieredStorageConfiguration.create(offloadPolicies.toProperties());
+        ChunkCache cache = getOrCreateChunkCache(config);
         return BlobStoreManagedLedgerOffloader.create(config, userMetadata, scheduler, readExecutor, offloaderStats,
-                entryOffsetsCache);
+                entryOffsetsCache, cache);
+    }
+
+    private ChunkCache getOrCreateChunkCache(TieredStorageConfiguration config) {
+        if (chunkCache == null) {
+            synchronized (this) {
+                if (chunkCache == null) {
+                    int chunkSize = config.getReadBufferSizeInBytes();
+                    long cacheSizeBytes = (long) config.getChunkCacheSizeInMB() * 1024 * 1024;
+                    int ttl = config.getChunkCacheTTLInSeconds();
+                    chunkCache = new ChunkCache(cacheSizeBytes, ttl, chunkSize);
+                }
+            }
+        }
+        return chunkCache;
     }
 
     @Override
     public void close() throws Exception {
         entryOffsetsCache.close();
+        if (chunkCache != null) {
+            chunkCache.close();
+        }
     }
 }

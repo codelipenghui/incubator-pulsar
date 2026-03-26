@@ -346,6 +346,20 @@ public class TieredStorageConfiguration {
         return overrides;
     }
 
+    public int getChunkCacheSizeInMB() {
+        if (configProperties.containsKey("managedLedgerOffloadChunkCacheSizeInMB")) {
+            return Integer.parseInt(configProperties.get("managedLedgerOffloadChunkCacheSizeInMB"));
+        }
+        // Default: 15% of max direct memory, converted to MB
+        long maxDirectMemory = io.netty.util.internal.PlatformDependent.maxDirectMemory();
+        return (int) ((maxDirectMemory * 0.15) / (1024 * 1024));
+    }
+
+    public int getChunkCacheTTLInSeconds() {
+        return Integer.parseInt(
+            configProperties.getOrDefault("managedLedgerOffloadChunkCacheTTLInSeconds", "60"));
+    }
+
     /*
      * Interfaces for the JCloudBlobStoreProvider's to implement
      */

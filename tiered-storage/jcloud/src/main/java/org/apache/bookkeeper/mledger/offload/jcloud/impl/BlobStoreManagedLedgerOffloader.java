@@ -111,6 +111,7 @@ public class BlobStoreManagedLedgerOffloader implements LedgerOffloader {
     private final AtomicLong segmentLength = new AtomicLong(0);
     private final long maxBufferLength;
     private final OffsetsCache entryOffsetsCache;
+    private final ChunkCache chunkCache;
     private final ConcurrentLinkedQueue<Entry> offloadBuffer = new ConcurrentLinkedQueue<>();
     private CompletableFuture<OffloadResult> offloadResult;
     private volatile Position lastOfferedPosition = PositionFactory.LATEST;
@@ -128,17 +129,18 @@ public class BlobStoreManagedLedgerOffloader implements LedgerOffloader {
                                                          OrderedScheduler scheduler,
                                                          OrderedScheduler readExecutor,
                                                          LedgerOffloaderStats offloaderStats,
-                                                         OffsetsCache entryOffsetsCache)
+                                                         OffsetsCache entryOffsetsCache,
+                                                         ChunkCache chunkCache)
             throws IOException {
 
         return new BlobStoreManagedLedgerOffloader(config, scheduler, readExecutor,
-                userMetadata, offloaderStats, entryOffsetsCache);
+                userMetadata, offloaderStats, entryOffsetsCache, chunkCache);
     }
 
     BlobStoreManagedLedgerOffloader(TieredStorageConfiguration config, OrderedScheduler scheduler,
                                     OrderedScheduler readExecutor,
                                     Map<String, String> userMetadata, LedgerOffloaderStats offloaderStats,
-                                    OffsetsCache entryOffsetsCache) {
+                                    OffsetsCache entryOffsetsCache, ChunkCache chunkCache) {
         this.scheduler = scheduler;
         this.readExecutor = readExecutor;
         this.userMetadata = userMetadata;
@@ -153,6 +155,7 @@ public class BlobStoreManagedLedgerOffloader implements LedgerOffloader {
         //ensure buffer can have enough content to fill a block
         this.maxBufferLength = Math.max(config.getWriteBufferSizeInBytes(), config.getMinBlockSizeInBytes());
         this.entryOffsetsCache = entryOffsetsCache;
+        this.chunkCache = chunkCache;
         this.segmentBeginTimeMillis = System.currentTimeMillis();
         if (!Strings.isNullOrEmpty(config.getRegion())) {
             this.writeLocation = new LocationBuilder()
@@ -252,7 +255,7 @@ public class BlobStoreManagedLedgerOffloader implements LedgerOffloader {
                     int blockSize = BlockAwareSegmentInputStreamImpl
                         .calculateBlockSize(config.getMaxBlockSizeInBytes(), readHandle, startEntry, entryBytesWritten);
 
-                    try (BlockAwareSegmentInputStream blockStream = new BlockAwareSegmentInputStreamImpl(
+                    try (BlockAwareSegmentInputStreamImpl blockStream = new BlockAwareSegmentInputStreamImpl(
                             readHandle, startEntry, blockSize, this.offloaderStats, managedLedgerName)) {
 
                         Payload partPayload = Payloads.newInputStreamPayload(blockStream);
@@ -263,6 +266,17 @@ public class BlobStoreManagedLedgerOffloader implements LedgerOffloader {
                                 config.getBucket(), dataBlockKey, partId, mpu.id());
 
                         indexBuilder.addBlock(startEntry, partId, blockSize);
+
+                        // Add per-entry offsets to the index builder.
+                        // dataObjectLength is the cumulative size of all blocks written so far
+                        // BEFORE the current block, so dataObjectLength + offsetWithinBlock
+                        // gives the absolute position in the data object.
+                        for (long[] entryOffset : blockStream.getEntryOffsets()) {
+                            long entryId = entryOffset[0];
+                            long offsetInBlock = entryOffset[1];
+                            long absoluteOffset = dataObjectLength + offsetInBlock;
+                            indexBuilder.addEntryOffset(entryId, absoluteOffset);
+                        }
 
                         if (blockStream.getEndEntryId() != -1) {
                             startEntry = blockStream.getEndEntryId() + 1;
@@ -574,7 +588,7 @@ public class BlobStoreManagedLedgerOffloader implements LedgerOffloader {
                         DataBlockUtils.VERSION_CHECK,
                         ledgerId, config.getReadBufferSizeInBytes(),
                         this.offloaderStats, offloadDriverMetadata.get(MANAGED_LEDGER_NAME),
-                        this.entryOffsetsCache));
+                        this.entryOffsetsCache, this.chunkCache));
             } catch (Throwable t) {
                 log.error("Failed readOffloaded: ", t);
                 promise.completeExceptionally(t);

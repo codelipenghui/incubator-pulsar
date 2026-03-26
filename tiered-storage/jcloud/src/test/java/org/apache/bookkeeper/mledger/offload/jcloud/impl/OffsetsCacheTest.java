@@ -20,6 +20,8 @@ package org.apache.bookkeeper.mledger.offload.jcloud.impl;
 
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertNull;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import lombok.extern.slf4j.Slf4j;
 import org.testng.annotations.Test;
 
@@ -41,5 +43,26 @@ public class OffsetsCacheTest {
         Thread.sleep(2000);
         assertNull(offsetsCache.getIfPresent(1, 2));
         offsetsCache.close();
+    }
+
+    @Test
+    public void testBulkPut() {
+        System.setProperty("pulsar.jclouds.readhandleimpl.offsetsscache.ttl.seconds", "1");
+        OffsetsCache cache = new OffsetsCache();
+        Map<Long, Long> entries = new LinkedHashMap<>();
+        entries.put(0L, 128L);
+        entries.put(1L, 4240L);
+        entries.put(2L, 8352L);
+        entries.put(3L, 12464L);
+
+        cache.bulkPut(12345L, entries);
+
+        assertEquals(cache.getIfPresent(12345L, 0L), Long.valueOf(128L));
+        assertEquals(cache.getIfPresent(12345L, 1L), Long.valueOf(4240L));
+        assertEquals(cache.getIfPresent(12345L, 2L), Long.valueOf(8352L));
+        assertEquals(cache.getIfPresent(12345L, 3L), Long.valueOf(12464L));
+        assertNull(cache.getIfPresent(12345L, 4L));
+
+        cache.close();
     }
 }

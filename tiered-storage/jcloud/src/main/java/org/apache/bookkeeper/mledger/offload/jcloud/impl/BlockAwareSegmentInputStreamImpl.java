@@ -25,6 +25,8 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.CompositeByteBuf;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
@@ -79,6 +81,9 @@ public class BlockAwareSegmentInputStreamImpl extends BlockAwareSegmentInputStre
     private int currentOffset = 0;
     private final AtomicBoolean close = new AtomicBoolean(false);
 
+    // Track per-entry offsets: list of [entryId, offsetWithinBlock]
+    private final List<long[]> entryOffsets = new ArrayList<>();
+
     public BlockAwareSegmentInputStreamImpl(ReadHandle ledger, long startEntryId, int blockSize) {
         this.ledger = ledger;
         this.startEntryId = startEntryId;
@@ -112,6 +117,13 @@ public class BlockAwareSegmentInputStreamImpl extends BlockAwareSegmentInputStre
             && bytesReadOffset + entriesByteBuf.get(0).readableBytes() <= blockSize) {
             // always read from the first ByteBuf in the list, once read all of its content remove it.
             ByteBuf entryByteBuf = entriesByteBuf.get(0);
+
+            // Capture entry offset when first starting to read this entry
+            if (currentOffset == 0) {
+                long entryId = entryByteBuf.getLong(4); // skip 4-byte length to get 8-byte entryId
+                entryOffsets.add(new long[]{entryId, bytesReadOffset});
+            }
+
             int readableBytes = entryByteBuf.readableBytes();
             int read = Math.min(readableBytes, len);
             ByteBuf buf = entryByteBuf.slice(currentOffset, read);
@@ -158,6 +170,13 @@ public class BlockAwareSegmentInputStreamImpl extends BlockAwareSegmentInputStre
         if (!entriesByteBuf.isEmpty() && bytesReadOffset + entriesByteBuf.get(0).readableBytes() <= blockSize) {
             // always read from the first ByteBuf in the list, once read all of its content remove it.
             ByteBuf entryByteBuf = entriesByteBuf.get(0);
+
+            // Capture entry offset when first starting to read this entry
+            if (entryByteBuf.readerIndex() == 0) {
+                long entryId = entryByteBuf.getLong(4); // skip 4-byte length to get 8-byte entryId
+                entryOffsets.add(new long[]{entryId, bytesReadOffset});
+            }
+
             int ret = entryByteBuf.readUnsignedByte();
             bytesReadOffset++;
 
@@ -329,6 +348,10 @@ public class BlockAwareSegmentInputStreamImpl extends BlockAwareSegmentInputStre
     @Override
     public int getBlockEntryBytesCount() {
         return dataBlockFullOffset - DataBlockHeaderImpl.getDataStartOffset() - ENTRY_HEADER_SIZE * blockEntryCount;
+    }
+
+    public List<long[]> getEntryOffsets() {
+        return Collections.unmodifiableList(entryOffsets);
     }
 
     public static long getHeaderSize() {
