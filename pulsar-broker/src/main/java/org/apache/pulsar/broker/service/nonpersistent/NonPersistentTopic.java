@@ -1037,7 +1037,9 @@ public class NonPersistentTopic extends AbstractTopic implements Topic, TopicPol
 
     @Override
     public void checkGC() {
-        if (!isDeleteWhileInactive()) {
+        boolean deleteEnabled = isDeleteWhileInactive();
+        boolean closeEnabled = !deleteEnabled && isCloseWhileInactive();
+        if (!deleteEnabled && !closeEnabled) {
             // This topic is not included in GC
             return;
         }
@@ -1048,11 +1050,30 @@ public class NonPersistentTopic extends AbstractTopic implements Topic, TopicPol
             if (System.nanoTime() - lastActive > TimeUnit.SECONDS.toNanos(maxInactiveDurationInSec)) {
 
                 // Close repl producers first.
-                // Once all repl producers are closed, we can delete the topic,
+                // Once all repl producers are closed, we can delete/close the topic,
                 // provided no remote producers connected to the broker.
                 if (log.isDebugEnabled()) {
                     log.debug("[{}] Topic inactive for {} seconds, closing repl producers.", topic,
                         maxInactiveDurationInSec);
+                }
+
+                if (closeEnabled) {
+                    stopReplProducers().thenCompose(v -> close(true, false))
+                            .thenRun(() -> log.info("[{}] Topic closed successfully due to inactivity", topic))
+                            .exceptionally(e -> {
+                                Throwable throwable = e.getCause();
+                                if (throwable instanceof TopicBusyException) {
+                                    if (log.isDebugEnabled()) {
+                                        log.debug("[{}] Did not close busy topic: {}", topic,
+                                                throwable.getMessage());
+                                    }
+                                    replicators.forEach((region, replicator) -> replicator.startProducer());
+                                } else {
+                                    log.warn("[{}] Inactive topic close failed", topic, e);
+                                }
+                                return null;
+                            });
+                    return;
                 }
 
                 stopReplProducers().thenCompose(v -> delete(true, false))
