@@ -46,12 +46,20 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.ReadEntryCallback;
 import org.apache.bookkeeper.mledger.ManagedCursor;
 import org.apache.bookkeeper.mledger.ManagedLedger;
@@ -71,9 +79,11 @@ import org.apache.pulsar.broker.transaction.metadata.TxnPaths;
 import org.apache.pulsar.broker.transaction.metadata.TxnState;
 import org.apache.pulsar.broker.transaction.pendingack.TransactionPendingAckStoreProvider;
 import org.apache.pulsar.client.api.transaction.TxnID;
+import org.apache.pulsar.client.util.ExecutorProvider;
 import org.apache.pulsar.common.api.proto.CommandAck.AckType;
 import org.apache.pulsar.common.api.proto.MessageMetadata;
 import org.apache.pulsar.common.protocol.Commands;
+import org.apache.pulsar.common.stats.PositionInPendingAckStats;
 import org.apache.pulsar.metadata.api.GetResult;
 import org.apache.pulsar.metadata.api.MetadataStore;
 import org.apache.pulsar.metadata.api.MetadataStoreConfig;
@@ -148,6 +158,720 @@ public class MetadataPendingAckStoreTest {
         }
         if (store != null) {
             store.close();
+        }
+    }
+
+    @Test
+    public void lateSuccessfulAppendAfterConsumedAbortEventReleasesBothBatchMasks() throws Exception {
+        TxnID txn = new TxnID(3, 37);
+        createOpenHeader(txn);
+        TxnMetadataStore delayed = spy(txnStore);
+        CompletableFuture<Void> releaseWrites = new CompletableFuture<>();
+        AtomicInteger appendsStarted = new AtomicInteger();
+        CountDownLatch terminalEventConsumed = new CountDownLatch(1);
+        AtomicInteger notifications = new AtomicInteger();
+        doAnswer(invocation -> {
+            String key = invocation.getArgument(0);
+            TxnOp operation = invocation.getArgument(1);
+            appendsStarted.incrementAndGet();
+            // The native metadata append itself happens after the terminal event, not merely its reply.
+            return releaseWrites.thenCompose(ignored -> txnStore.appendOp(key, operation));
+        }).when(delayed).appendOp(any(), any());
+        doAnswer(invocation -> {
+            Consumer<String> listener = invocation.getArgument(2);
+            return txnStore.subscribeSubscriptionEvents(invocation.getArgument(0), invocation.getArgument(1), path -> {
+                listener.accept(path);
+                notifications.incrementAndGet();
+                terminalEventConsumed.countDown();
+            });
+        }).when(delayed).subscribeSubscriptionEvents(eq(SEGMENT), eq(SUB), any());
+        ActualHandle fixture = new ActualHandle(delayed);
+        try {
+            Position first = createPositionWithAckSet(5, 45, new long[]{14L});
+            Position second = createPositionWithAckSet(6, 66, new long[]{14L});
+            CompletableFuture<Void> acknowledged = fixture.handle.individualAcknowledgeMessage(txn,
+                    List.of(MutablePair.of(first, 4), MutablePair.of(second, 4)));
+            Awaitility.await().until(() -> appendsStarted.get() == 2);
+            assertThat(acknowledged).as("real handle waits for both native ACK appends").isNotDone();
+            abortHeader(txn);
+            txnStore.publishSubscriptionEvent(SEGMENT, SUB,
+                    new TxnEvent(TxnIds.toKey(txn), TxnState.ABORTED)).get(5, TimeUnit.SECONDS);
+            assertThat(terminalEventConsumed.await(5, TimeUnit.SECONDS))
+                    .as("the real subscription callback consumed the only terminal notification").isTrue();
+            assertThat(notifications.get()).isEqualTo(1);
+            List<TxnOp> beforeAppend = new ArrayList<>();
+            txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(beforeAppend)).get(5, TimeUnit.SECONDS);
+            assertThat(beforeAppend).as("the terminal event precedes the actual ACK metadata writes").isEmpty();
+            assertThat(fixture.redeliveries).isEmpty();
+
+            releaseWrites.complete(null);
+            acknowledged.get(5, TimeUnit.SECONDS);
+            // No second event is published. The successful append must close the missed-event window.
+            Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+                assertThat(fixture.handle.getStats(false).ongoingTxnSize).isZero();
+                fixture.assertPending(first, 0, false);
+                fixture.assertPending(second, 0, false);
+                assertThat(fixture.redeliveries).hasSize(1);
+                assertThat(fixture.redeliveries.get(0)).extracting(position ->
+                        position.getLedgerId() + ":" + position.getEntryId()).containsExactlyInAnyOrder("5:45", "6:66");
+                assertThat(fixture.redeliveries.get(0)).allSatisfy(position ->
+                        assertThat(getAckSetArrayOrNull(position)).containsExactly(14L));
+                List<TxnOp> remaining = new ArrayList<>();
+                txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(remaining)).get(5, TimeUnit.SECONDS);
+                assertThat(remaining)
+                        .as("ACK ops retire only after the real abort released both reservations").isEmpty();
+            });
+            assertThat(fixture.cursorAcks).as("an ABORT never acknowledges either input").isEmpty();
+            assertThat(notifications.get()).as("cleanup must not depend on a second terminal event").isEqualTo(1);
+        } finally {
+            releaseWrites.complete(null);
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void synchronousSuccessfulAppendReadsTerminalOnlyAfterRealHandleInstallation() throws Exception {
+        TxnID txn = new TxnID(3, 38);
+        createOpenHeader(txn);
+        abortHeader(txn);
+        TxnMetadataStore synchronous = spy(txnStore);
+        Position position = createPositionWithAckSet(6, 66, new long[]{14L});
+        AtomicReference<ActualHandle> fixtureReference = new AtomicReference<>();
+        AtomicInteger headerReads = new AtomicInteger();
+        doAnswer(invocation -> CompletableFuture.completedFuture(txnStore.appendOp(
+                invocation.getArgument(0), invocation.getArgument(1)).get(5, TimeUnit.SECONDS)))
+                .when(synchronous).appendOp(any(), any());
+        doAnswer(invocation -> {
+            ActualHandle fixture = fixtureReference.get();
+            assertThat(fixture).as("success reconciliation runs after real handle recovery").isNotNull();
+            if (headerReads.getAndIncrement() == 0) {
+                fixture.assertPending(position, 0, true);
+                fixture.assertPending(position, 1, false);
+            }
+            return txnStore.getHeader(invocation.getArgument(0));
+        }).when(synchronous).getHeader(TxnIds.toKey(txn));
+        try (ActualHandle fixture = new ActualHandle(synchronous)) {
+            fixtureReference.set(fixture);
+            fixture.handle.individualAcknowledgeMessage(txn, List.of(MutablePair.of(position, 4)))
+                    .get(5, TimeUnit.SECONDS);
+            Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+                assertThat(headerReads.get()).as("a successful append must not miss a prior terminal decision")
+                        .isPositive();
+                assertThat(fixture.redeliveries).hasSize(1);
+                fixture.assertPending(position, 0, false);
+                List<TxnOp> remaining = new ArrayList<>();
+                txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(remaining)).get(5, TimeUnit.SECONDS);
+                assertThat(remaining).isEmpty();
+            });
+            assertThat(getAckSetArrayOrNull(fixture.redeliveries.get(0).get(0))).containsExactly(14L);
+            assertThat(fixture.cursorAcks).isEmpty();
+        }
+    }
+
+    @Test
+    public void lateSuccessfulCommittedAppendPreservesPartialBatchRecoveryRecord() throws Exception {
+        TxnID txn = new TxnID(3, 39);
+        createOpenHeader(txn);
+        DelayedNativeSuccess delayed = new DelayedNativeSuccess();
+        ActualHandle fixture = new ActualHandle(delayed.backing);
+        try {
+            Position position = createPositionWithAckSet(6, 66, new long[]{14L});
+            CompletableFuture<Void> acknowledged = fixture.handle.individualAcknowledgeMessage(txn,
+                    List.of(MutablePair.of(position, 4)));
+            Awaitility.await().until(() -> delayed.started.get() == 1);
+            commitHeader(txn);
+            delayed.publishAndAwait(txn, TxnState.COMMITTED);
+            delayed.release.complete(null);
+            acknowledged.get(5, TimeUnit.SECONDS);
+            Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+                assertThat(fixture.cursorAcks).hasSize(1);
+                assertThat(fixture.handle.getStats(false).ongoingTxnSize).isZero();
+            });
+            assertThat(getAckSetArrayOrNull(fixture.cursorAcks.get(0).get(0))).containsExactly(14L);
+            assertThat(fixture.redeliveries).isEmpty();
+            List<TxnOp> retained = new ArrayList<>();
+            txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(retained)).get(5, TimeUnit.SECONDS);
+            assertThat(retained).as("volatile partial cursor application cannot delete recovery evidence").hasSize(1);
+            assertThat(retained.get(0).getAckSet()).containsExactly(14L);
+            assertThat(delayed.notifications.get()).isEqualTo(1);
+        } finally {
+            delayed.release.complete(null);
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void successfulAppendWithMissingHeaderRetainsUnknownReservationUntilConfirmedAbort() throws Exception {
+        TxnID txn = new TxnID(3, 40);
+        createOpenHeader(txn);
+        DelayedNativeSuccess delayed = new DelayedNativeSuccess();
+        AtomicInteger headerReads = new AtomicInteger();
+        doAnswer(invocation -> {
+            headerReads.incrementAndGet();
+            return txnStore.getHeader(invocation.getArgument(0));
+        }).when(delayed.backing).getHeader(TxnIds.toKey(txn));
+        ActualHandle fixture = new ActualHandle(delayed.backing);
+        try {
+            Position position = createPositionWithAckSet(6, 66, new long[]{14L});
+            CompletableFuture<Void> acknowledged = fixture.handle.individualAcknowledgeMessage(txn,
+                    List.of(MutablePair.of(position, 4)));
+            Awaitility.await().until(() -> delayed.started.get() == 1);
+            long version = txnStore.getHeader(TxnIds.toKey(txn)).get(5, TimeUnit.SECONDS).orElseThrow().version();
+            txnStore.deleteHeader(TxnIds.toKey(txn), version).get(5, TimeUnit.SECONDS);
+            delayed.release.complete(null);
+            acknowledged.get(5, TimeUnit.SECONDS);
+            Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> headerReads.get() > 0);
+            fixture.awaitRetry();
+            replayExecutor.submit(() -> null).get(5, TimeUnit.SECONDS);
+            fixture.assertPending(position, 0, true);
+            fixture.assertPending(position, 1, false);
+            assertThat(fixture.redeliveries).as("header absence is UNKNOWN, never a synthetic abort").isEmpty();
+            assertThat(fixture.cursorAcks).isEmpty();
+            List<TxnOp> retained = new ArrayList<>();
+            txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(retained)).get(5, TimeUnit.SECONDS);
+            assertThat(retained).hasSize(1);
+            assertThat(retained.get(0).getAckSet()).containsExactly(14L);
+            txnStore.createHeader(TxnIds.toKey(txn), new TxnHeader(TxnState.ABORTED,
+                    Duration.ofSeconds(60), Instant.ofEpochMilli(1000), Instant.now(), null))
+                    .get(5, TimeUnit.SECONDS);
+            fixture.runRetry();
+            Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+                fixture.assertPending(position, 0, false);
+                assertThat(fixture.redeliveries).hasSize(1);
+                List<TxnOp> remaining = new ArrayList<>();
+                txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(remaining)).get(5, TimeUnit.SECONDS);
+                assertThat(remaining).isEmpty();
+            });
+            assertThat(delayed.notifications.get()).as("UNKNOWN resolution must not borrow another event").isZero();
+        } finally {
+            delayed.release.complete(null);
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void closeDuringSuccessfulAppendDrainsAcceptedWriteWithoutStartingHeaderReads() throws Exception {
+        TxnID txn = new TxnID(3, 41);
+        createOpenHeader(txn);
+        DelayedNativeSuccess delayed = new DelayedNativeSuccess();
+        ActualHandle fixture = new ActualHandle(delayed.backing);
+        try {
+            Position position = createPositionWithAckSet(6, 66, new long[]{14L});
+            CompletableFuture<Void> acknowledged = fixture.handle.individualAcknowledgeMessage(txn,
+                    List.of(MutablePair.of(position, 4)));
+            Awaitility.await().until(() -> delayed.started.get() == 1);
+            CompletableFuture<Void> closed = fixture.ackStore.closeAsync();
+            assertThat(closed).as("an accepted native write must drain before close completes").isNotDone();
+            delayed.release.complete(null);
+            acknowledged.get(5, TimeUnit.SECONDS);
+            closed.get(5, TimeUnit.SECONDS);
+            replayExecutor.submit(() -> null).get(5, TimeUnit.SECONDS);
+            verify(delayed.backing, never()).getHeader(any());
+            assertThat(fixture.retries).isEmpty();
+            assertThat(fixture.redeliveries).isEmpty();
+            assertThat(fixture.cursorAcks).isEmpty();
+            List<TxnOp> retained = new ArrayList<>();
+            txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(retained)).get(5, TimeUnit.SECONDS);
+            assertThat(retained).as("close must preserve accepted durable ACK evidence for recovery").hasSize(1);
+            assertThat(retained.get(0).getAckSet()).containsExactly(14L);
+        } finally {
+            delayed.release.complete(null);
+            fixture.close();
+        }
+    }
+
+    @DataProvider
+    public Object[][] lateSuccessfulOverlapInitialAppendModes() {
+        return new Object[][]{{false}, {true}};
+    }
+
+    @Test(dataProvider = "lateSuccessfulOverlapInitialAppendModes")
+    public void olderTerminalCleanupCannotDeleteLaterSuccessfulAppendBeforeActivation(boolean uncertainFirst)
+            throws Exception {
+        TxnID txn = new TxnID(3, 42);
+        createOpenHeader(txn);
+        TxnMetadataStore controlled = spy(txnStore);
+        CompletableFuture<Void> firstAbortCompletion = new CompletableFuture<>();
+        CompletableFuture<Void> secondAckResponse = new CompletableFuture<>();
+        CompletableFuture<Stat> secondPersisted = new CompletableFuture<>();
+        AtomicInteger appends = new AtomicInteger();
+        doAnswer(invocation -> {
+            CompletableFuture<Stat> nativeWrite = txnStore.appendOp(
+                    invocation.getArgument(0), invocation.getArgument(1));
+            if (appends.incrementAndGet() == 1) {
+                return uncertainFirst ? nativeWrite.thenCompose(ignored -> CompletableFuture.failedFuture(
+                        new MetadataStoreException("first ACK append response lost"))) : nativeWrite;
+            }
+            return nativeWrite.thenCompose(stat -> {
+                secondPersisted.complete(stat);
+                return secondAckResponse.thenApply(ignored -> stat);
+            });
+        }).when(controlled).appendOp(any(), any());
+        ActualHandle fixture = new ActualHandle(controlled, firstAbortCompletion);
+        try {
+            Position first = createPositionWithAckSet(5, 45, new long[]{14L});
+            Position second = createPositionWithAckSet(6, 66, new long[]{14L});
+            CompletableFuture<Void> firstAck = fixture.handle.individualAcknowledgeMessage(txn,
+                    List.of(MutablePair.of(first, 4)));
+            if (uncertainFirst) {
+                expectAppendFailure(firstAck);
+                fixture.awaitRetry();
+            } else {
+                firstAck.get(5, TimeUnit.SECONDS);
+            }
+            abortHeader(txn);
+            txnStore.publishSubscriptionEvent(SEGMENT, SUB,
+                    new TxnEvent(TxnIds.toKey(txn), TxnState.ABORTED)).get(5, TimeUnit.SECONDS);
+            if (uncertainFirst) {
+                fixture.runRetry();
+            }
+            Awaitility.await().untilAsserted(() -> {
+                assertThat(fixture.redeliveries).as("the real first abort ran, but its returned future is held")
+                        .hasSize(1);
+                fixture.assertPending(first, 0, false);
+            });
+            CompletableFuture<Void> secondAck = fixture.handle.individualAcknowledgeMessage(txn,
+                    List.of(MutablePair.of(second, 4)));
+            Stat secondRecord = secondPersisted.get(5, TimeUnit.SECONDS);
+            assertThat(secondAck).as("native op2 exists before its reservation installation callback").isNotDone();
+            fixture.assertPending(second, 0, false);
+            List<TxnOp> both = new ArrayList<>();
+            txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(both)).get(5, TimeUnit.SECONDS);
+            assertThat(both).hasSize(2);
+
+            firstAbortCompletion.complete(null);
+            Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+                List<TxnOp> retained = new ArrayList<>();
+                txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(retained)).get(5, TimeUnit.SECONDS);
+                assertThat(retained).as("older cleanup may delete only its pre-abort immutable snapshot").hasSize(1);
+                assertThat(retained.get(0).getLedgerId()).isEqualTo(6);
+                assertThat(retained.get(0).getEntryId()).isEqualTo(66);
+                assertThat(retained.get(0).getAckSet()).containsExactly(14L);
+                assertThat(store.get(secondRecord.getPath(), Set.of(new Option.PartitionKey(TxnIds.toKey(txn))))
+                        .get(5, TimeUnit.SECONDS))
+                        .as("op2 remains native metadata until its own activation").isPresent();
+            });
+            assertThat(fixture.redeliveries).hasSize(1);
+            secondAckResponse.complete(null);
+            secondAck.get(5, TimeUnit.SECONDS);
+            if (uncertainFirst) {
+                // A retry already queued by the old uncertain generation must not retire new work early.
+                // The successful append's own after-install path can now observe the same durable abort.
+                replayExecutor.submit(() -> null).get(5, TimeUnit.SECONDS);
+            }
+            Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+                assertThat(fixture.redeliveries).hasSize(2);
+                fixture.assertPending(second, 0, false);
+                List<TxnOp> remaining = new ArrayList<>();
+                txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(remaining)).get(5, TimeUnit.SECONDS);
+                assertThat(remaining).isEmpty();
+            });
+            assertThat(fixture.redeliveries).allSatisfy(positions -> {
+                assertThat(positions).hasSize(1);
+                assertThat(getAckSetArrayOrNull(positions.get(0))).containsExactly(14L);
+            });
+            assertThat(fixture.cursorAcks).isEmpty();
+        } finally {
+            firstAbortCompletion.complete(null);
+            secondAckResponse.complete(null);
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void abortEventDuringHeldOpenReadRequiresAnotherFreshHeaderRead() throws Exception {
+        TxnID txn = new TxnID(3, 43);
+        createOpenHeader(txn);
+        TxnMetadataStore held = spy(txnStore);
+        CompletableFuture<Void> releaseOpenReply = new CompletableFuture<>();
+        CountDownLatch openCaptured = new CountDownLatch(1);
+        CountDownLatch notificationConsumed = new CountDownLatch(1);
+        AtomicInteger reads = new AtomicInteger();
+        AtomicInteger notifications = new AtomicInteger();
+        doAnswer(invocation -> {
+            var actualRead = txnStore.getHeader(invocation.getArgument(0));
+            if (reads.incrementAndGet() == 1) {
+                return actualRead.thenCompose(header -> {
+                    assertThat(header.orElseThrow().value().getState()).isEqualTo(TxnState.OPEN);
+                    openCaptured.countDown();
+                    return releaseOpenReply.thenApply(ignored -> header);
+                });
+            }
+            return actualRead;
+        }).when(held).getHeader(TxnIds.toKey(txn));
+        doAnswer(invocation -> {
+            Consumer<String> listener = invocation.getArgument(2);
+            return txnStore.subscribeSubscriptionEvents(invocation.getArgument(0), invocation.getArgument(1), path -> {
+                listener.accept(path);
+                notifications.incrementAndGet();
+                notificationConsumed.countDown();
+            });
+        }).when(held).subscribeSubscriptionEvents(eq(SEGMENT), eq(SUB), any());
+        ActualHandle fixture = new ActualHandle(held);
+        try {
+            Position position = createPositionWithAckSet(6, 66, new long[]{14L});
+            fixture.handle.individualAcknowledgeMessage(txn, List.of(MutablePair.of(position, 4)))
+                    .get(5, TimeUnit.SECONDS);
+            assertThat(openCaptured.await(5, TimeUnit.SECONDS)).isTrue();
+            fixture.assertPending(position, 0, true);
+            abortHeader(txn);
+            txnStore.publishSubscriptionEvent(SEGMENT, SUB,
+                    new TxnEvent(TxnIds.toKey(txn), TxnState.ABORTED)).get(5, TimeUnit.SECONDS);
+            assertThat(notificationConsumed.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(reads.get()).as("a dirty in-flight read is coalesced, not run concurrently").isEqualTo(1);
+            releaseOpenReply.complete(null);
+            Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+                assertThat(reads.get()).as("the notification cannot disappear behind an older OPEN result")
+                        .isGreaterThanOrEqualTo(2);
+                fixture.assertPending(position, 0, false);
+                assertThat(fixture.redeliveries).hasSize(1);
+                List<TxnOp> remaining = new ArrayList<>();
+                txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(remaining)).get(5, TimeUnit.SECONDS);
+                assertThat(remaining).isEmpty();
+            });
+            assertThat(notifications.get()).isEqualTo(1);
+            assertThat(fixture.cursorAcks).isEmpty();
+            assertThat(getAckSetArrayOrNull(fixture.redeliveries.get(0).get(0))).containsExactly(14L);
+        } finally {
+            releaseOpenReply.complete(null);
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void failedSoleAbortEventReadAfterConfirmedOpenRetriesWithoutAnotherEvent() throws Exception {
+        TxnID txn = new TxnID(3, 44);
+        createOpenHeader(txn);
+        TxnMetadataStore observed = spy(txnStore);
+        AtomicInteger reads = new AtomicInteger();
+        AtomicInteger notifications = new AtomicInteger();
+        doAnswer(invocation -> reads.incrementAndGet() == 3
+                ? CompletableFuture.failedFuture(new MetadataStoreException("sole ABORT event read failed"))
+                : txnStore.getHeader(invocation.getArgument(0)))
+                .when(observed).getHeader(TxnIds.toKey(txn));
+        doAnswer(invocation -> {
+            Consumer<String> listener = invocation.getArgument(2);
+            return txnStore.subscribeSubscriptionEvents(invocation.getArgument(0), invocation.getArgument(1), path -> {
+                listener.accept(path);
+                notifications.incrementAndGet();
+            });
+        }).when(observed).subscribeSubscriptionEvents(eq(SEGMENT), eq(SUB), any());
+        try (ActualHandle fixture = new ActualHandle(observed)) {
+            Position position = createPositionWithAckSet(6, 66, new long[]{14L});
+            fixture.handle.individualAcknowledgeMessage(txn, List.of(MutablePair.of(position, 4)))
+                    .get(5, TimeUnit.SECONDS);
+            Awaitility.await().until(() -> reads.get() == 1);
+            txnStore.publishSubscriptionEvent(SEGMENT, SUB, new TxnEvent(TxnIds.toKey(txn), TxnState.OPEN))
+                    .get(5, TimeUnit.SECONDS);
+            // Read2 starts only after read1 confirmed OPEN, even if the first callback was still in flight.
+            Awaitility.await().until(() -> reads.get() == 2 && notifications.get() == 1);
+            abortHeader(txn);
+            txnStore.publishSubscriptionEvent(SEGMENT, SUB, new TxnEvent(TxnIds.toKey(txn), TxnState.ABORTED))
+                    .get(5, TimeUnit.SECONDS);
+            Awaitility.await().until(() -> reads.get() == 3 && notifications.get() == 2);
+            fixture.awaitRetry();
+            fixture.assertPending(position, 0, true);
+            assertThat(fixture.redeliveries).isEmpty();
+            fixture.runRetry();
+            Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+                assertThat(reads.get()).isGreaterThanOrEqualTo(4);
+                fixture.assertPending(position, 0, false);
+                assertThat(fixture.redeliveries).hasSize(1);
+                List<TxnOp> remaining = new ArrayList<>();
+                txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(remaining)).get(5, TimeUnit.SECONDS);
+                assertThat(remaining).isEmpty();
+            });
+            assertThat(notifications.get()).as("no later notification rescues the failed ABORT read").isEqualTo(2);
+            assertThat(getAckSetArrayOrNull(fixture.redeliveries.get(0).get(0))).containsExactly(14L);
+            assertThat(fixture.cursorAcks).isEmpty();
+        }
+    }
+
+    @Test
+    public void laterSuccessfulAppendInstallsOnlyAfterOlderCommitCursorCallbackFinishes() throws Exception {
+        TxnID txn = new TxnID(3, 45);
+        createOpenHeader(txn);
+        TxnMetadataStore observed = spy(txnStore);
+        AtomicInteger appends = new AtomicInteger();
+        CompletableFuture<Stat> secondPersisted = new CompletableFuture<>();
+        doAnswer(invocation -> {
+            int ordinal = appends.incrementAndGet();
+            return txnStore.appendOp(invocation.getArgument(0), invocation.getArgument(1)).thenApply(stat -> {
+                if (ordinal == 2) {
+                    secondPersisted.complete(stat);
+                }
+                return stat;
+            });
+        }).when(observed).appendOp(any(), any());
+        CompletableFuture<Void> firstCursorCompletion = new CompletableFuture<>();
+        CountDownLatch secondCompletionTask = new CountDownLatch(1);
+        AtomicInteger completedPinTasks = new AtomicInteger();
+        replayExecutor = new AfterCleanupExecutor(replayExecutor, () -> {
+            if (completedPinTasks.incrementAndGet() == 2) {
+                secondCompletionTask.countDown();
+            }
+        });
+        ActualHandle fixture = new ActualHandle(observed,
+                CompletableFuture.completedFuture(null), firstCursorCompletion);
+        try {
+            Position first = createPositionWithAckSet(5, 45, new long[]{14L});
+            Position second = createPositionWithAckSet(6, 66, new long[]{14L});
+            fixture.handle.individualAcknowledgeMessage(txn, List.of(MutablePair.of(first, 4)))
+                    .get(5, TimeUnit.SECONDS);
+            commitHeader(txn);
+            publishDecision(txn);
+            Awaitility.await().until(() -> fixture.cursorAcks.size() == 1);
+            CompletableFuture<Void> secondAck = fixture.handle.individualAcknowledgeMessage(txn,
+                    List.of(MutablePair.of(second, 4)));
+            secondPersisted.get(5, TimeUnit.SECONDS);
+            assertThat(secondCompletionTask.await(5, TimeUnit.SECONDS))
+                    .as("the native second completion task actually reached the pin").isTrue();
+            replayExecutor.submit(() -> null).get(5, TimeUnit.SECONDS);
+            assertThat(secondAck).as("do not install a reservation that the older commit callback would erase")
+                    .isNotDone();
+            fixture.assertPending(second, 0, false);
+            List<TxnOp> both = new ArrayList<>();
+            txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(both)).get(5, TimeUnit.SECONDS);
+            assertThat(both).as("native writes continue while local installation is fenced").hasSize(2);
+            firstCursorCompletion.complete(null);
+            secondAck.get(5, TimeUnit.SECONDS);
+            Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+                assertThat(fixture.cursorAcks).as("the newer reservation receives its own committed application")
+                        .hasSize(2);
+                assertThat(fixture.handle.getStats(false).ongoingTxnSize).isZero();
+            });
+            assertThat(fixture.cursorAcks).allSatisfy(positions -> {
+                assertThat(positions).hasSize(1);
+                assertThat(getAckSetArrayOrNull(positions.get(0))).containsExactly(14L);
+            });
+            assertThat(fixture.cursorAcks).extracting(positions -> positions.get(0).getLedgerId()
+                    + ":" + positions.get(0).getEntryId()).containsExactly("5:45", "6:66");
+            List<TxnOp> retained = new ArrayList<>();
+            txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(retained)).get(5, TimeUnit.SECONDS);
+            assertThat(retained).as("neither volatile cursor callback proves whole-entry durability").hasSize(2);
+            assertThat(retained).allSatisfy(operation -> assertThat(operation.getAckSet()).containsExactly(14L));
+            assertThat(fixture.redeliveries).isEmpty();
+        } finally {
+            firstCursorCompletion.complete(null);
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void closeDrainsTerminalDeferredSuccessfulAppendAndFreshHandleRecoversBothMasks() throws Exception {
+        TxnID txn = new TxnID(3, 46);
+        createOpenHeader(txn);
+        TxnMetadataStore observed = spy(txnStore);
+        AtomicInteger appends = new AtomicInteger();
+        AtomicInteger reads = new AtomicInteger();
+        CompletableFuture<Stat> secondPersisted = new CompletableFuture<>();
+        doAnswer(invocation -> {
+            reads.incrementAndGet();
+            return txnStore.getHeader(invocation.getArgument(0));
+        }).when(observed).getHeader(TxnIds.toKey(txn));
+        doAnswer(invocation -> {
+            int ordinal = appends.incrementAndGet();
+            return txnStore.appendOp(invocation.getArgument(0), invocation.getArgument(1)).thenApply(stat -> {
+                if (ordinal == 2) {
+                    secondPersisted.complete(stat);
+                }
+                return stat;
+            });
+        }).when(observed).appendOp(any(), any());
+        CompletableFuture<Void> firstCursorCompletion = new CompletableFuture<>();
+        CountDownLatch secondCompletionTask = new CountDownLatch(1);
+        AtomicInteger completions = new AtomicInteger();
+        replayExecutor = new AfterCleanupExecutor(replayExecutor, () -> {
+            if (completions.incrementAndGet() == 2) {
+                secondCompletionTask.countDown();
+            }
+        });
+        ActualHandle fixture = new ActualHandle(observed,
+                CompletableFuture.completedFuture(null), firstCursorCompletion);
+        try {
+            Position first = createPositionWithAckSet(5, 45, new long[]{14L});
+            Position second = createPositionWithAckSet(6, 66, new long[]{14L});
+            fixture.handle.individualAcknowledgeMessage(txn, List.of(MutablePair.of(first, 4)))
+                    .get(5, TimeUnit.SECONDS);
+            commitHeader(txn);
+            publishDecision(txn);
+            Awaitility.await().until(() -> fixture.cursorAcks.size() == 1);
+            CompletableFuture<Void> secondAck = fixture.handle.individualAcknowledgeMessage(txn,
+                    List.of(MutablePair.of(second, 4)));
+            secondPersisted.get(5, TimeUnit.SECONDS);
+            assertThat(secondCompletionTask.await(5, TimeUnit.SECONDS)).isTrue();
+            replayExecutor.submit(() -> null).get(5, TimeUnit.SECONDS);
+            assertThat(secondAck).isNotDone();
+            int readsAtClose = reads.get();
+            fixture.ackStore.closeAsync().get(5, TimeUnit.SECONDS);
+            secondAck.get(5, TimeUnit.SECONDS);
+            assertThat(firstCursorCompletion).as("close drains native appends without borrowing cursor completion")
+                    .isNotDone();
+            replayExecutor.submit(() -> null).get(5, TimeUnit.SECONDS);
+            assertThat(reads.get()).as("closed store starts no late header reads").isEqualTo(readsAtClose);
+            assertThat(fixture.retries).isEmpty();
+            List<TxnOp> retained = new ArrayList<>();
+            txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(retained)).get(5, TimeUnit.SECONDS);
+            assertThat(retained).hasSize(2);
+            assertThat(retained).allSatisfy(operation -> assertThat(operation.getAckSet()).containsExactly(14L));
+        } finally {
+            firstCursorCompletion.complete(null);
+            fixture.close();
+        }
+        try (ActualHandle recovered = new ActualHandle(txnStore)) {
+            assertThat(recovered.handle.getStats(false).ongoingTxnSize).isZero();
+            assertThat(recovered.cursorAcks).as("fresh real handle replays both retained committed masks").hasSize(1);
+            assertThat(recovered.cursorAcks.get(0)).extracting(position -> position.getLedgerId()
+                    + ":" + position.getEntryId()).containsExactlyInAnyOrder("5:45", "6:66");
+            assertThat(recovered.cursorAcks.get(0)).allSatisfy(position ->
+                    assertThat(getAckSetArrayOrNull(position)).containsExactly(14L));
+        }
+    }
+
+    @Test
+    public void terminalSnapshotWaitsForEveryAdmittedNativeAppendAndHandleActivation() throws Exception {
+        TxnID txn = new TxnID(3, 47);
+        createOpenHeader(txn);
+        TxnMetadataStore delayed = spy(txnStore);
+        CompletableFuture<Void> firstWrite = new CompletableFuture<>();
+        CompletableFuture<Void> secondWrite = new CompletableFuture<>();
+        AtomicInteger admitted = new AtomicInteger();
+        CountDownLatch eventConsumed = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            String key = invocation.getArgument(0);
+            TxnOp operation = invocation.getArgument(1);
+            CompletableFuture<Void> release = admitted.incrementAndGet() == 1 ? firstWrite : secondWrite;
+            return release.thenCompose(ignored -> txnStore.appendOp(key, operation));
+        }).when(delayed).appendOp(any(), any());
+        doAnswer(invocation -> {
+            Consumer<String> listener = invocation.getArgument(2);
+            return txnStore.subscribeSubscriptionEvents(invocation.getArgument(0), invocation.getArgument(1), path -> {
+                listener.accept(path);
+                eventConsumed.countDown();
+            });
+        }).when(delayed).subscribeSubscriptionEvents(eq(SEGMENT), eq(SUB), any());
+        ActualHandle fixture = new ActualHandle(delayed);
+        try {
+            Position first = createPositionWithAckSet(5, 45, new long[]{14L});
+            Position second = createPositionWithAckSet(6, 66, new long[]{14L});
+            CompletableFuture<Void> firstAck = fixture.handle.individualAcknowledgeMessage(txn,
+                    List.of(MutablePair.of(first, 4)));
+            CompletableFuture<Void> secondAck = fixture.handle.individualAcknowledgeMessage(txn,
+                    List.of(MutablePair.of(second, 4)));
+            Awaitility.await().until(() -> admitted.get() == 2);
+            abortHeader(txn);
+            txnStore.publishSubscriptionEvent(SEGMENT, SUB, new TxnEvent(TxnIds.toKey(txn), TxnState.ABORTED))
+                    .get(5, TimeUnit.SECONDS);
+            assertThat(eventConsumed.await(5, TimeUnit.SECONDS)).isTrue();
+            firstWrite.complete(null);
+            firstAck.get(5, TimeUnit.SECONDS);
+            replayExecutor.submit(() -> null).get(5, TimeUnit.SECONDS);
+            fixture.assertPending(first, 0, true);
+            fixture.assertPending(second, 0, false);
+            assertThat(secondAck).isNotDone();
+            assertThat(fixture.redeliveries).as("the second admitted append is still before handle installation")
+                    .isEmpty();
+            verify(delayed, never()).collectAckOpsForSegmentSubscription(any(), any());
+            verify(delayed, never()).deleteOps(any());
+            List<TxnOp> firstOnly = new ArrayList<>();
+            txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(firstOnly)).get(5, TimeUnit.SECONDS);
+            assertThat(firstOnly).hasSize(1);
+            assertThat(firstOnly.get(0).getAckSet()).containsExactly(14L);
+            secondWrite.complete(null);
+            secondAck.get(5, TimeUnit.SECONDS);
+            Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+                assertThat(fixture.redeliveries).hasSize(1);
+                assertThat(fixture.redeliveries.get(0)).hasSize(2);
+                assertThat(fixture.redeliveries.get(0)).allSatisfy(position ->
+                        assertThat(getAckSetArrayOrNull(position)).containsExactly(14L));
+                fixture.assertPending(first, 0, false);
+                fixture.assertPending(second, 0, false);
+                List<TxnOp> remaining = new ArrayList<>();
+                txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(remaining)).get(5, TimeUnit.SECONDS);
+                assertThat(remaining).isEmpty();
+            });
+            assertThat(fixture.cursorAcks).isEmpty();
+        } finally {
+            firstWrite.complete(null);
+            secondWrite.complete(null);
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void laterCumulativeAppendInstallsOnlyAfterOlderCommitCursorCallbackFinishes() throws Exception {
+        TxnID txn = new TxnID(3, 48);
+        createOpenHeader(txn);
+        TxnMetadataStore observed = spy(txnStore);
+        AtomicInteger appends = new AtomicInteger();
+        CompletableFuture<Stat> secondPersisted = new CompletableFuture<>();
+        doAnswer(invocation -> {
+            int ordinal = appends.incrementAndGet();
+            return txnStore.appendOp(invocation.getArgument(0), invocation.getArgument(1)).thenApply(stat -> {
+                if (ordinal == 2) {
+                    secondPersisted.complete(stat);
+                }
+                return stat;
+            });
+        }).when(observed).appendOp(any(), any());
+        CompletableFuture<Void> firstCursorCompletion = new CompletableFuture<>();
+        CountDownLatch secondCompletionTask = new CountDownLatch(1);
+        AtomicInteger completedPinTasks = new AtomicInteger();
+        replayExecutor = new AfterCleanupExecutor(replayExecutor, () -> {
+            if (completedPinTasks.incrementAndGet() == 2) {
+                secondCompletionTask.countDown();
+            }
+        });
+        ActualHandle fixture = new ActualHandle(observed,
+                CompletableFuture.completedFuture(null), firstCursorCompletion);
+        try {
+            Position first = PositionFactory.create(3, 5);
+            Position higher = PositionFactory.create(3, 6);
+            fixture.handle.cumulativeAcknowledgeMessage(txn, List.of(first)).get(5, TimeUnit.SECONDS);
+            assertThat(fixture.handle.getTransactionInPendingAckStats(txn).cumulativeAckPosition).isEqualTo("3:5");
+            commitHeader(txn);
+            publishDecision(txn);
+            Awaitility.await().untilAsserted(() -> {
+                assertThat(fixture.cursorAcks).hasSize(1);
+                assertThat(fixture.cursorAckTypes).containsExactly(AckType.Cumulative);
+            });
+            assertThat(fixture.cursorAcks.get(0)).extracting(position ->
+                    position.getLedgerId() + ":" + position.getEntryId()).containsExactly("3:5");
+            CompletableFuture<Void> secondAck = fixture.handle.cumulativeAcknowledgeMessage(txn, List.of(higher));
+            secondPersisted.get(5, TimeUnit.SECONDS);
+            assertThat(secondCompletionTask.await(5, TimeUnit.SECONDS))
+                    .as("the native higher cumulative completion actually reached the pin").isTrue();
+            replayExecutor.submit(() -> null).get(5, TimeUnit.SECONDS);
+            assertThat(secondAck).as("the older commit must not later clear a newly installed cumulative slot")
+                    .isNotDone();
+            assertThat(fixture.handle.getTransactionInPendingAckStats(txn).cumulativeAckPosition)
+                    .as("the higher cumulative reservation is not installed while the first callback is pending")
+                    .isEqualTo("3:5");
+            List<TxnOp> both = new ArrayList<>();
+            txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(both)).get(5, TimeUnit.SECONDS);
+            assertThat(both).as("both native cumulative ops persist while installation is fenced").hasSize(2);
+            assertThat(both).allSatisfy(operation -> {
+                assertThat(operation.getCumulative()).isTrue();
+                assertThat(operation.getAckSet()).isNull();
+            });
+            firstCursorCompletion.complete(null);
+            secondAck.get(5, TimeUnit.SECONDS);
+            Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+                assertThat(fixture.cursorAcks).as("the higher cumulative ACK receives its own committed application")
+                        .hasSize(2);
+                assertThat(fixture.cursorAckTypes).containsExactly(AckType.Cumulative, AckType.Cumulative);
+            });
+            assertThat(fixture.cursorAcks).extracting(positions -> positions.get(0).getLedgerId()
+                    + ":" + positions.get(0).getEntryId()).containsExactly("3:5", "3:6");
+            assertThat(fixture.cursorAcks).allSatisfy(positions -> assertThat(positions).hasSize(1));
+            List<TxnOp> retained = new ArrayList<>();
+            txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(retained)).get(5, TimeUnit.SECONDS);
+            assertThat(retained).as("volatile cumulative cursor callbacks do not prove durable whole-entry coverage")
+                    .hasSize(2);
+            assertThat(fixture.redeliveries).isEmpty();
+        } finally {
+            firstCursorCompletion.complete(null);
+            fixture.close();
         }
     }
 
@@ -466,6 +1190,471 @@ public class MetadataPendingAckStoreTest {
         } finally {
             firstCursorAck.complete(null);
             recoveredHandle.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    public void failedAppendWithoutOpsReleasesReservationAfterAbortAndTransientHeaderRead() throws Exception {
+        TxnID txn = new TxnID(1, 1);
+        createOpenHeader(txn);
+        abortHeader(txn);
+        TxnMetadataStore unavailable = spy(txnStore);
+        doReturn(CompletableFuture.failedFuture(new MetadataStoreException("uncertain append")))
+                .when(unavailable).appendOp(any(), any());
+        AtomicInteger reads = new AtomicInteger();
+        doAnswer(invocation -> reads.getAndIncrement() == 0
+                ? CompletableFuture.failedFuture(new MetadataStoreException("temporary header read failure"))
+                : txnStore.getHeader(invocation.getArgument(0))).when(unavailable).getHeader(any());
+        try (ActualHandle fixture = new ActualHandle(unavailable)) {
+            Position position = createPositionWithAckSet(3, 5, new long[]{12L});
+            expectAppendFailure(fixture.handle.individualAcknowledgeMessage(txn,
+                    List.of(MutablePair.of(position, 4))));
+            fixture.assertPending(position, 0, true);
+            fixture.assertPending(position, 1, true);
+            fixture.assertPending(position, 2, false);
+            assertThat(reads.get()).as("failed handle reservation precedes the first uncertainty poll").isZero();
+            fixture.runRetry();
+            fixture.awaitRetry();
+            fixture.assertPending(position, 0, true);
+            assertThat(fixture.cursorAcks).isEmpty();
+            fixture.runRetry();
+            Awaitility.await().untilAsserted(() -> {
+                assertThat(fixture.handle.getStats(false).ongoingTxnSize).isZero();
+                fixture.assertPending(position, 0, false);
+                fixture.assertPending(position, 1, false);
+                assertThat(fixture.redeliveries).hasSize(1);
+            });
+            assertThat(getAckSetArrayOrNull(fixture.redeliveries.get(0).get(0))).containsExactly(12L);
+            List<TxnOp> ops = new ArrayList<>();
+            txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(ops)).get();
+            assertThat(ops).isEmpty();
+            assertThat(reads.get()).isEqualTo(2);
+        }
+    }
+
+    @Test
+    public void lateFailedAppendOfSameTxnIsNotRetiredByEarlierAbortCleanup() throws Exception {
+        TxnID txn = new TxnID(1, 1);
+        createOpenHeader(txn);
+        TxnMetadataStore unavailable = spy(txnStore);
+        CompletableFuture<Stat> first = new CompletableFuture<>();
+        CompletableFuture<Stat> second = new CompletableFuture<>();
+        AtomicInteger appends = new AtomicInteger();
+        doAnswer(invocation -> appends.getAndIncrement() == 0 ? first : second)
+                .when(unavailable).appendOp(any(), any());
+        CompletableFuture<Void> cleanup = new CompletableFuture<>();
+        AtomicInteger cleanups = new AtomicInteger();
+        doAnswer(invocation -> cleanups.getAndIncrement() == 0 ? cleanup
+                : txnStore.deleteOps(invocation.getArgument(0)))
+                .when(unavailable).deleteOps(any());
+        ActualHandle fixture = new ActualHandle(unavailable);
+        try {
+            Position selectedFirst = createPositionWithAckSet(3, 5, new long[]{14L});
+            Position selectedSecond = createPositionWithAckSet(3, 5, new long[]{13L});
+            CompletableFuture<Void> ackFirst = fixture.handle.individualAcknowledgeMessage(txn,
+                    List.of(MutablePair.of(selectedFirst, 4)));
+            Awaitility.await().until(() -> appends.get() == 1);
+            abortHeader(txn);
+            first.completeExceptionally(new MetadataStoreException("first uncertain append"));
+            expectAppendFailure(ackFirst);
+            fixture.runRetry();
+            Awaitility.await().until(() -> cleanups.get() == 1);
+            fixture.assertPending(selectedFirst, 0, false);
+            // Admit the second append only after the real first abort reached its held exact cleanup.
+            CompletableFuture<Void> ackSecond = fixture.handle.individualAcknowledgeMessage(txn,
+                    List.of(MutablePair.of(selectedSecond, 4)));
+            Awaitility.await().until(() -> appends.get() == 2);
+            second.completeExceptionally(new MetadataStoreException("late uncertain append"));
+            replayExecutor.submit(() -> null).get(5, TimeUnit.SECONDS);
+            assertThat(ackSecond).as("older terminal application fences later reservation installation").isNotDone();
+            fixture.assertPending(selectedSecond, 1, false);
+            cleanup.complete(null);
+            expectAppendFailure(ackSecond);
+            fixture.awaitRetry();
+            fixture.assertPending(selectedSecond, 1, true);
+            fixture.assertPending(selectedSecond, 0, false);
+            fixture.runRetry();
+            Awaitility.await().untilAsserted(() -> {
+                assertThat(fixture.handle.getStats(false).ongoingTxnSize).isZero();
+                fixture.assertPending(selectedSecond, 1, false);
+                assertThat(fixture.redeliveries).hasSize(2);
+            });
+            assertThat(getAckSetArrayOrNull(fixture.redeliveries.get(0).get(0))).containsExactly(14L);
+            assertThat(getAckSetArrayOrNull(fixture.redeliveries.get(1).get(0))).containsExactly(13L);
+        } finally {
+            first.completeExceptionally(new MetadataStoreException("test finished"));
+            second.completeExceptionally(new MetadataStoreException("test finished"));
+            cleanup.complete(null);
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void missingHeaderDoesNotReleaseAnUncertainReservation() throws Exception {
+        TxnID txn = new TxnID(1, 1);
+        createOpenHeader(txn);
+        TxnMetadataStore unavailable = spy(txnStore);
+        doReturn(CompletableFuture.failedFuture(new MetadataStoreException("uncertain append")))
+                .when(unavailable).appendOp(any(), any());
+        try (ActualHandle fixture = new ActualHandle(unavailable)) {
+            Position position = createPositionWithAckSet(3, 5, new long[]{14L});
+            expectAppendFailure(fixture.handle.individualAcknowledgeMessage(txn,
+                    List.of(MutablePair.of(position, 4))));
+            long version = txnStore.getHeader(TxnIds.toKey(txn)).get().orElseThrow().version();
+            txnStore.deleteHeader(TxnIds.toKey(txn), version).get();
+            fixture.runRetry();
+            fixture.awaitRetry();
+            fixture.assertPending(position, 0, true);
+            assertThat(fixture.redeliveries).isEmpty();
+            assertThat(fixture.cursorAcks).isEmpty();
+        }
+    }
+
+    @Test
+    public void committedUncertainAppendRetainsItsMaskAndCannotBePromotedByDirectCommit() throws Exception {
+        TxnID txn = new TxnID(1, 1);
+        createOpenHeader(txn);
+        TxnMetadataStore unavailable = spy(txnStore);
+        doReturn(CompletableFuture.failedFuture(new MetadataStoreException("uncertain append")))
+                .when(unavailable).appendOp(any(), any());
+        try (ActualHandle fixture = new ActualHandle(unavailable)) {
+            Position position = createPositionWithAckSet(3, 5, new long[]{12L});
+            expectAppendFailure(fixture.handle.individualAcknowledgeMessage(txn,
+                    List.of(MutablePair.of(position, 4))));
+            commitHeader(txn);
+            doReturn(CompletableFuture.completedFuture(txnStore.getHeader(TxnIds.toKey(txn)).get()))
+                    .when(unavailable).getHeader(TxnIds.toKey(txn));
+            fixture.runRetry();
+            assertThat(fixture.handle.commitTxn(txn, Map.of(), 0L)).failsWithin(Duration.ofSeconds(5))
+                    .withThrowableOfType(ExecutionException.class).withCauseInstanceOf(IllegalStateException.class);
+            fixture.assertPending(position, 0, true);
+            fixture.assertPending(position, 1, true);
+            fixture.assertPending(position, 2, false);
+            assertThat(fixture.cursorAcks).isEmpty();
+            assertThat(fixture.redeliveries).isEmpty();
+            verify(unavailable, never()).deleteOps(any());
+        }
+    }
+
+    @Test
+    public void persistedThenFailedCommitIsRetainedForFreshHandleRecovery() throws Exception {
+        TxnID txn = new TxnID(1, 1);
+        createOpenHeader(txn);
+        TxnMetadataStore uncertain = spy(txnStore);
+        doAnswer(invocation -> txnStore.appendOp(invocation.getArgument(0), invocation.getArgument(1))
+                .thenCompose(ignored -> CompletableFuture.failedFuture(new MetadataStoreException("lost reply"))))
+                .when(uncertain).appendOp(any(), any());
+        try (ActualHandle fixture = new ActualHandle(uncertain)) {
+            Position position = createPositionWithAckSet(3, 5, new long[]{12L});
+            expectAppendFailure(fixture.handle.individualAcknowledgeMessage(txn,
+                    List.of(MutablePair.of(position, 4))));
+            commitHeader(txn);
+            doReturn(CompletableFuture.completedFuture(txnStore.getHeader(TxnIds.toKey(txn)).get()))
+                    .when(uncertain).getHeader(TxnIds.toKey(txn));
+            fixture.runRetry();
+            fixture.assertPending(position, 0, true);
+            assertThat(fixture.cursorAcks).isEmpty();
+        }
+        List<TxnOp> retained = new ArrayList<>();
+        txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(retained)).get();
+        assertThat(retained).hasSize(1);
+        assertThat(retained.get(0).getBatchSize()).isEqualTo(4);
+        assertThat(retained.get(0).getAckSet()).containsExactly(12L);
+        try (ActualHandle recovered = new ActualHandle(txnStore)) {
+            assertThat(recovered.handle.getStats(false).ongoingTxnSize).isZero();
+            assertThat(recovered.cursorAcks).hasSize(1);
+            assertThat(getAckSetArrayOrNull(recovered.cursorAcks.get(0).get(0))).containsExactly(12L);
+            retained.clear();
+            txnStore.listAcksBySegmentSubscription(SEGMENT, SUB, collectOps(retained)).get();
+            assertThat(retained).as("volatile cursor application does not retire batch recovery masks").hasSize(1);
+        }
+    }
+
+    @Test
+    public void closeBeforeUncertaintyActivationDoesNotStartHeaderReads() throws Exception {
+        TxnID txn = new TxnID(1, 1);
+        createOpenHeader(txn);
+        TxnMetadataStore unavailable = spy(txnStore);
+        CompletableFuture<Stat> persisted = new CompletableFuture<>();
+        doReturn(persisted).when(unavailable).appendOp(any(), any());
+        try (ActualHandle fixture = new ActualHandle(unavailable)) {
+            CompletableFuture<Void> closed = new CompletableFuture<>();
+            CompletableFuture<Void> ack = fixture.handle.individualAcknowledgeMessage(txn,
+                    List.of(MutablePair.of(PositionFactory.create(3, 5), 1)));
+            // This callback runs when the handle has installed its failed-ACK reservation, before
+            // the store's next pin task can activate the uncertainty monitor.
+            ack.whenComplete((ignored, error) -> fixture.ackStore.closeAsync()
+                    .whenComplete((value, failure) -> {
+                        if (failure == null) {
+                            closed.complete(null);
+                        } else {
+                            closed.completeExceptionally(failure);
+                        }
+                    }));
+            persisted.completeExceptionally(new MetadataStoreException("uncertain append"));
+            expectAppendFailure(ack);
+            closed.get(5, TimeUnit.SECONDS);
+            replayExecutor.submit(() -> null).get(5, TimeUnit.SECONDS);
+            assertThat(fixture.retries).isEmpty();
+            verify(unavailable, never()).getHeader(any());
+        }
+    }
+
+    @Test
+    public void rejectedFailedAppendCompletionStillDrainsStoreClose() throws Exception {
+        TxnMetadataStore unavailable = spy(txnStore);
+        doReturn(CompletableFuture.failedFuture(new MetadataStoreException("uncertain append")))
+                .when(unavailable).appendOp(any(), any());
+        ExecutorService stopped = mock(ExecutorService.class);
+        doAnswer(invocation -> {
+            throw new RejectedExecutionException("executor stopped");
+        }).when(stopped).execute(any());
+        MetadataPendingAckStore ackStore = new MetadataPendingAckStore(subscription, unavailable);
+        ackStore.replayAsync(handle, stopped);
+        assertThat(ackStore.recoveryFuture()).failsWithin(Duration.ofSeconds(5))
+                .withThrowableOfType(ExecutionException.class);
+        expectAppendFailure(ackStore.appendIndividualAck(new TxnID(1, 1),
+                List.of(MutablePair.of(PositionFactory.create(3, 5), 1))));
+        ackStore.closeAsync().get(5, TimeUnit.SECONDS);
+    }
+
+    @Test
+    public void queuedFailedAppendCompletionSurvivesExecutorShutdownNow() throws Exception {
+        TxnMetadataStore unavailable = spy(txnStore);
+        doReturn(CompletableFuture.failedFuture(new MetadataStoreException("uncertain append")))
+                .when(unavailable).appendOp(any(), any());
+        ExecutorProvider provider = new ExecutorProvider(1, "uncertain-append-shutdown", true);
+        ExecutorService pinned = provider.getExecutor();
+        MetadataPendingAckStore ackStore = new MetadataPendingAckStore(subscription, unavailable);
+        try {
+            ackStore.replayAsync(handle, pinned);
+            ackStore.recoveryFuture().get(5, TimeUnit.SECONDS);
+            CountDownLatch occupied = new CountDownLatch(1);
+            pinned.execute(() -> {
+                occupied.countDown();
+                try {
+                    new CountDownLatch(1).await();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            assertThat(occupied.await(5, TimeUnit.SECONDS)).isTrue();
+            CompletableFuture<Void> append = ackStore.appendIndividualAck(new TxnID(1, 1),
+                    List.of(MutablePair.of(PositionFactory.create(3, 5), 1)));
+            assertThat(append).as("failure completion is accepted but queued behind the busy pin").isNotDone();
+            CompletableFuture<Void> close = ackStore.closeAsync();
+            assertThat(close).as("close must drain the accepted append completion").isNotDone();
+            provider.shutdownNow();
+            expectAppendFailure(append);
+            close.get(5, TimeUnit.SECONDS);
+            verify(unavailable, never()).getHeader(any());
+        } finally {
+            provider.shutdownNow();
+            ackStore.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    public void successfulAppendDoesNotStartUncertaintyPolling() throws Exception {
+        TxnID txn = new TxnID(1, 1);
+        createOpenHeader(txn);
+        TxnMetadataStore observed = spy(txnStore);
+        try (ActualHandle fixture = new ActualHandle(observed)) {
+            fixture.handle.individualAcknowledgeMessage(txn,
+                    List.of(MutablePair.of(PositionFactory.create(3, 5), 1))).get(5, TimeUnit.SECONDS);
+            Awaitility.await().untilAsserted(() -> verify(observed, times(1)).getHeader(TxnIds.toKey(txn)));
+            assertThat(fixture.retries).isEmpty();
+            assertThat(fixture.handle.getStats(false).ongoingTxnSize).isEqualTo(1);
+            assertThat(fixture.cursorAcks).isEmpty();
+            assertThat(fixture.redeliveries).isEmpty();
+        }
+    }
+
+    @Test
+    public void closeCancelsPendingUncertaintyRetryAndLateTaskDoesNotReadHeaders() throws Exception {
+        TxnID txn = new TxnID(1, 1);
+        createOpenHeader(txn);
+        TxnMetadataStore unavailable = spy(txnStore);
+        doReturn(CompletableFuture.failedFuture(new MetadataStoreException("uncertain append")))
+                .when(unavailable).appendOp(any(), any());
+        try (ActualHandle fixture = new ActualHandle(unavailable)) {
+            expectAppendFailure(fixture.handle.individualAcknowledgeMessage(txn,
+                    List.of(MutablePair.of(PositionFactory.create(3, 5), 1))));
+            fixture.awaitRetry();
+            ScheduledFuture<?> pending = fixture.retryFutures.get(0);
+            fixture.ackStore.closeAsync().get(5, TimeUnit.SECONDS);
+            verify(pending).cancel(false);
+            fixture.runRetry();
+            verify(unavailable, never()).getHeader(any());
+        }
+    }
+
+    private static void expectAppendFailure(CompletableFuture<Void> ack) {
+        assertThat(ack).failsWithin(Duration.ofSeconds(5)).withThrowableOfType(ExecutionException.class)
+                .withCauseInstanceOf(MetadataStoreException.class);
+    }
+
+    private static final class AfterCleanupExecutor extends AbstractExecutorService {
+        private final ExecutorService delegate;
+        private final Runnable afterCleanup;
+
+        private AfterCleanupExecutor(ExecutorService delegate, Runnable afterCleanup) {
+            this.delegate = delegate;
+            this.afterCleanup = afterCleanup;
+        }
+
+        @Override
+        public void execute(Runnable command) {
+            delegate.execute(() -> {
+                command.run();
+                if (command instanceof ExecutorProvider.CleanupTask) {
+                    afterCleanup.run();
+                }
+            });
+        }
+
+        @Override
+        public void shutdown() {
+            delegate.shutdown();
+        }
+
+        @Override
+        public List<Runnable> shutdownNow() {
+            return delegate.shutdownNow();
+        }
+
+        @Override
+        public boolean isShutdown() {
+            return delegate.isShutdown();
+        }
+
+        @Override
+        public boolean isTerminated() {
+            return delegate.isTerminated();
+        }
+
+        @Override
+        public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
+            return delegate.awaitTermination(timeout, unit);
+        }
+    }
+
+    private final class DelayedNativeSuccess {
+        private final TxnMetadataStore backing = spy(txnStore);
+        private final CompletableFuture<Void> release = new CompletableFuture<>();
+        private final AtomicInteger started = new AtomicInteger();
+        private final AtomicInteger notifications = new AtomicInteger();
+        private final CountDownLatch consumed = new CountDownLatch(1);
+
+        private DelayedNativeSuccess() throws Exception {
+            doAnswer(invocation -> {
+                String key = invocation.getArgument(0);
+                TxnOp operation = invocation.getArgument(1);
+                started.incrementAndGet();
+                return release.thenCompose(ignored -> txnStore.appendOp(key, operation));
+            }).when(backing).appendOp(any(), any());
+            doAnswer(invocation -> {
+                Consumer<String> listener = invocation.getArgument(2);
+                return txnStore.subscribeSubscriptionEvents(invocation.getArgument(0), invocation.getArgument(1),
+                        path -> {
+                            listener.accept(path);
+                            notifications.incrementAndGet();
+                            consumed.countDown();
+                        });
+            }).when(backing).subscribeSubscriptionEvents(eq(SEGMENT), eq(SUB), any());
+        }
+
+        private void publishAndAwait(TxnID txn, TxnState state) throws Exception {
+            txnStore.publishSubscriptionEvent(SEGMENT, SUB, new TxnEvent(TxnIds.toKey(txn), state))
+                    .get(5, TimeUnit.SECONDS);
+            assertThat(consumed.await(5, TimeUnit.SECONDS)).as("actual terminal callback consumed").isTrue();
+            assertThat(notifications.get()).isEqualTo(1);
+        }
+    }
+
+    private final class ActualHandle implements AutoCloseable {
+        private final MetadataPendingAckStore ackStore;
+        private final PendingAckHandleImpl handle;
+        private final List<Runnable> retries = new CopyOnWriteArrayList<>();
+        private final List<ScheduledFuture<?>> retryFutures = new CopyOnWriteArrayList<>();
+        private final List<List<Position>> cursorAcks = new CopyOnWriteArrayList<>();
+        private final List<AckType> cursorAckTypes = new CopyOnWriteArrayList<>();
+        private final List<List<Position>> redeliveries = new CopyOnWriteArrayList<>();
+
+        private ActualHandle(TxnMetadataStore backing) throws Exception {
+            this(backing, CompletableFuture.completedFuture(null));
+        }
+
+        private ActualHandle(TxnMetadataStore backing, CompletableFuture<Void> abortCompletion) throws Exception {
+            this(backing, abortCompletion, CompletableFuture.completedFuture(null));
+        }
+
+        private ActualHandle(TxnMetadataStore backing, CompletableFuture<Void> abortCompletion,
+                             CompletableFuture<Void> firstCursorCompletion) throws Exception {
+            when(cursor.getMarkDeletedPosition()).thenReturn(PositionFactory.create(3, 0));
+            when(cursor.getPersistentMarkDeletedPosition()).thenReturn(PositionFactory.create(3, 0));
+            PersistentSubscription actual = mock(PersistentSubscription.class, RETURNS_DEEP_STUBS);
+            when(actual.getTopicName()).thenReturn(SEGMENT);
+            when(actual.getName()).thenReturn(SUB);
+            when(actual.getCursor()).thenReturn(cursor);
+            when(actual.acknowledgeMessageAsync(anyList(), any(), any())).thenAnswer(invocation -> {
+                List<Position> positions = invocation.getArgument(0);
+                cursorAcks.add(List.copyOf(positions));
+                cursorAckTypes.add(invocation.getArgument(1));
+                return cursorAcks.size() == 1 ? firstCursorCompletion : CompletableFuture.completedFuture(null);
+            });
+            doAnswer(invocation -> {
+                List<Position> positions = invocation.getArgument(1);
+                redeliveries.add(List.copyOf(positions));
+                return null;
+            }).when(actual).redeliverUnacknowledgedMessages(any(), anyList());
+            var pulsar = actual.getTopic().getBrokerService().getPulsar();
+            when(pulsar.getTransactionExecutorProvider().getExecutor(any(PendingAckHandleImpl.class)))
+                    .thenReturn(replayExecutor);
+            ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
+            when(pulsar.getExecutor()).thenReturn(scheduler);
+            when(scheduler.schedule(any(Runnable.class), anyLong(), eq(TimeUnit.MILLISECONDS)))
+                    .thenAnswer(invocation -> {
+                        ScheduledFuture<?> future = mock(ScheduledFuture.class);
+                        retryFutures.add(future);
+                        retries.add(invocation.getArgument(0));
+                        return future;
+                    });
+            TransactionPendingAckStoreProvider provider = mock(TransactionPendingAckStoreProvider.class);
+            when(pulsar.getTransactionPendingAckStoreProvider()).thenReturn(provider);
+            when(provider.checkInitializedBefore(actual)).thenReturn(CompletableFuture.completedFuture(true));
+            ackStore = new MetadataPendingAckStore(actual, backing);
+            when(provider.newPendingAckStore(actual)).thenReturn(CompletableFuture.completedFuture(ackStore));
+            handle = new PendingAckHandleImpl(actual) {
+                @Override
+                public CompletableFuture<Void> abortTxn(TxnID txnId,
+                                                        org.apache.pulsar.broker.service.Consumer consumer,
+                                                        long lowWaterMark) {
+                    // Fault only the public completion boundary after the real reservation release/redelivery.
+                    return super.abortTxn(txnId, consumer, lowWaterMark).thenCompose(ignored -> abortCompletion);
+                }
+            };
+            handle.pendingAckHandleFuture().get(5, TimeUnit.SECONDS);
+            ackStore.recoveryFuture().get(5, TimeUnit.SECONDS);
+        }
+
+        private void assertPending(Position position, int batch, boolean expected) {
+            assertThat(handle.checkPositionInPendingAckState(position, batch).state).isEqualTo(expected
+                    ? PositionInPendingAckStats.State.PendingAck : PositionInPendingAckStats.State.NotInPendingAck);
+        }
+
+        private void awaitRetry() {
+            Awaitility.await().until(() -> !retries.isEmpty());
+        }
+
+        private void runRetry() {
+            awaitRetry();
+            retries.remove(0).run();
+        }
+
+        @Override
+        public void close() throws Exception {
+            handle.closeAsync().get(5, TimeUnit.SECONDS);
         }
     }
 
